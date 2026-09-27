@@ -112,7 +112,20 @@ thread 名——同一 OpenCode 项目/配置下的重连会落回同一分组�
 - **user tab**：UI 手工开的 tab 无组，任何 scope 首次用显式 tabId 寻址时
   隐式 claim 进组（对应 ZCode 的 claimTab；也可用 `browser_tabs action=claim`）。
 - **归还**：`markDeliverable`/`finalize`/`closeSession` 把 tab 释放回 user tab
-  （页面保留、脱离分组）。
+  （页面保留、脱离分组）。MCP session 收到 DELETE（显式 terminate）时也会
+  对该 session 寻址过的所有分组执行 closeSession。
+- **孤儿分组（session 死亡检测）**：MCP 客户端断开通常不发 DELETE（SDK 的
+  `client.close()` 只 abort standalone SSE），所以存活判定不看 transport
+  开关而看 SSE 流：挂过 SSE 的 session 断开超过
+  `BROWSER_MCP_ORPHAN_GRACE_MS`（默认 15s）即判死；从未挂 SSE 的纯 POST
+  客户端按 `BROWSER_MCP_SESSION_TTL_MS`（默认 30min）无活动判死。
+  死亡 session 的分组保留（chip 不消失），但其 tab 变成**孤儿 tab**：
+  `browser_tabs list` 的 `orphanTabs` 字段可见，任意存活 scope 可
+  `claim` 或用显式 tabId 寻址时隐式接管进自己的组。
+- **跨会话连续性**：要"重连后仍回到同一分组"（比如 OpenCode 同一对话），
+  用 `BROWSER_MCP_GROUP`/`x-bmcp-group`/`browser_scope set group=` 固定
+  thread 名；默认 thread=MCP session id，新会话永远是新分组（此时旧分组的
+  tab 走上面的孤儿接管路径）。
 - **命名**：`browser_scope set name=...`（或 `nameSession` 命令）改组名，
   未命名时显示 `client·thread前8位`；`browser_scope get` 查当前组信息。
 - **注意**：thread 是软身份（agent 自报），不是安全边界——同机协作场景够用；

@@ -43,6 +43,10 @@ WSL 里测 Windows 侧 HTTP：用 `curl.exe`/`node.exe`（WSL 内网不到 Windo
   不允许跨 scope 寻址其它组的 tab；user tab（UI 创建、groupId 为空）只能经
   resolveTab 隐式 claim 进组，不要直接改 groupId。同组 tab 必须经
   moveAfterGroupMates 保持连续（renderer 按连续 run 渲染 Edge 式 chip）。
+- session 存活：`isScopeLive` 由 mcpServer 注入（SSE 断开宽限 / 纯 POST 的
+  idle TTL）；死亡 session 的分组 tab 变孤儿（orphanTabs），resolveTab 显式
+  寻址孤儿 tab 时隐式接管——与 user tab 同规则，不要为此开第三条路径。
+  transport onclose（DELETE）时对该 session 寻址过的分组执行 closeSession。
 - 页面 popup（target=_blank / window.open）由 `setWindowOpenHandler` 统一 deny 默认
   BrowserWindow，走 `openPopupTab` 改建本窗口 tab：继承来源 tab 的 groupId、
   background-tab disposition 不抢焦点、只允许 http/https/about 协议。

@@ -110,6 +110,13 @@ export class TabManager {
   private groups = new Map<string, TabGroupInfo>();
   /** 每个 scope 最近使用的 tab（无显式 tabId 的命令落点，对应 ZCode 的 active/defaultTabByScope）。 */
   private lastTabByScope = new Map<string, string>();
+  /**
+   * mcpServer 注入：scopeKey 对应的分组属主 session 是否仍存活。
+   * MCP 客户端不发 DELETE 就断开时（进程退出/断网），其分组的 tab 变为
+   * 孤儿 tab——保留分组但可被任意存活 scope 显式 claim（对齐 user tab 语义）。
+   * 非 MCP 调用方（/command 调试端点）默认视为存活，维持严格隔离。
+   */
+  isScopeLive: (key: string) => boolean = () => true;
 
   constructor(
     private win: BrowserWindow,
@@ -245,6 +252,11 @@ export class TabManager {
     this.tabs = new Map(entries);
   }
 
+  /** 属主 session 已死的分组 tab：可被任意 scope 显式寻址时隐式接管。 */
+  private isOrphan(tab: ManagedTab): boolean {
+    return tab.groupId !== undefined && !this.isScopeLive(tab.groupId);
+  }
+
   /** user tab 被 agent 首次寻址 → 隐式 claim 进该 scope 的分组。 */
   private claimIntoGroup(tab: ManagedTab, scope: AgentScope): void {
     const group = this.groupFor(scope);
@@ -283,7 +295,7 @@ export class TabManager {
         this.lastTabByScope.set(gid, tab.tabId);
         return tab;
       }
-      if (tab.groupId === undefined) {
+      if (tab.groupId === undefined || this.isOrphan(tab)) {
         this.claimIntoGroup(tab, scope);
         return tab;
       }
@@ -438,15 +450,26 @@ export class TabManager {
 
     // ---- manager 级命令：不要求已 attach 的页面 ----
     switch (command.method) {
-      case "list":
-        // 本组受控 tab + 可被 claim 的 user tab；其它组的 tab 对 agent 不可见。
+      case "list": {
+        // 本组受控 tab + 可被 claim 的 user tab + 孤儿 tab（属主 session 已死，
+        // 可被接管）；其它存活组的 tab 对 agent 不可见。
+        const mine = scopeKey(scope);
         return finish({
           ok: true,
           tabs: [...this.tabs.values()]
-            .filter((t) => t.groupId === scopeKey(scope))
+            .filter((t) => t.groupId === mine)
             .map(scopedTabSummary),
           userTabs: this.userTabInfos(),
+          orphanTabs: [...this.tabs.values()]
+            .filter((t) => t.groupId !== undefined && t.groupId !== mine && this.isOrphan(t))
+            .map((t) => ({
+              id: t.tabId,
+              url: safe(() => t.view.webContents.getURL(), ""),
+              title: safe(() => t.view.webContents.getTitle(), ""),
+              tabGroup: this.groups.get(t.groupId ?? "")?.label,
+            })),
         });
+      }
       case "listUserTabs":
         return finish({ ok: true, userTabs: this.userTabInfos() });
       case "newTab": {

@@ -105,6 +105,8 @@ export const browserCommandResultSchema = z
     tabs: z.array(browserTabSummarySchema).optional(),
     /** BrowserUser.openTabs() 返回；与当前 session 自有 tabs.list() 严格分离。 */
     userTabs: z.array(browserUserTabInfoSchema).optional(),
+    /** 属主 session 已死的分组 tab（孤儿）；可被任意存活 scope 显式 claim 接管。 */
+    orphanTabs: z.array(browserUserTabInfoSchema).optional(),
     /** newTab 返回的单个真实 tab。 */
     tab: browserTabSummarySchema.optional(),
     /** evaluate 返回：页面表达式的可 JSON 序列化结果。 */

@@ -22,7 +22,20 @@ interface SessionScopeCtx {
   headerGroup?: string;
   threadOverride?: string;
   label?: string;
+  /** 本 session 实际寻址过的 thread（含逐调用 group 覆盖），close 时据此释放分组。 */
+  usedThreads: Set<string>;
+  /** 存活信号：客户端 close/断网不会发 DELETE，靠 standalone SSE 断开+宽限判定死亡。 */
+  lastSeen: number;
+  sseEverOpened: boolean;
+  /** 当前挂起的 standalone SSE GET 响应；关断时置空并记 sseClosedAt。 */
+  sseRes?: http.ServerResponse;
+  sseClosedAt?: number;
 }
+
+/** SSE 断开后的宽限期：SDK 客户端 transient 重连用，过了才算 session 死亡。 */
+const ORPHAN_GRACE_MS = Number(process.env.BROWSER_MCP_ORPHAN_GRACE_MS ?? 15_000);
+/** 从不挂 SSE 的纯 POST 客户端的兜底存活时长。 */
+const IDLE_TTL_MS = Number(process.env.BROWSER_MCP_SESSION_TTL_MS ?? 30 * 60_000);
 
 const tabId = z.string().optional().describe("Target tab id; defaults to the active tab");
 const modifiers = z
@@ -108,11 +121,16 @@ export function createBrowserMcpServer(
     { name: "browser-mcp", version: "0.1.0" },
     { capabilities: { logging: {} } },
   );
-  const scopeFor = (group?: string): AgentScope => ({
-    client: ctx.client,
-    thread: (group ?? ctx.threadOverride ?? ctx.headerGroup ?? ctx.id ?? "default").trim() || "default",
-    ...(ctx.label ? { label: ctx.label } : {}),
-  });
+  const scopeFor = (group?: string): AgentScope => {
+    const thread =
+      (group ?? ctx.threadOverride ?? ctx.headerGroup ?? ctx.id ?? "default").trim() || "default";
+    ctx.usedThreads.add(thread);
+    return {
+      client: ctx.client,
+      thread,
+      ...(ctx.label ? { label: ctx.label } : {}),
+    };
+  };
   const reg = (
     name: string,
     description: string,
@@ -420,8 +438,9 @@ export function createBrowserMcpServer(
     {
       description:
         "Manage tabs: action=list | new | activate | close | claim. " +
-        "list returns this group's tabs plus claimable user tabs; " +
-        "claim takes ownership of a user-opened tab into this group.",
+        "list returns this group's tabs, claimable user tabs, and orphanTabs " +
+        "(tabs left by dead agent sessions — claimable via claim or by " +
+        "addressing them with an explicit tabId).",
       inputSchema: {
         action: z.enum(["list", "new", "activate", "close", "claim"]),
         tabId: z.string().optional(),
@@ -597,6 +616,32 @@ export function createBrowserMcpServer(
 export function createMcpHttpHandler(tabManager: TabManager) {
   const execute: Execute = (command, scope) => tabManager.execute(scope, command);
   const transports = new Map<string, StreamableHTTPServerTransport>();
+  /** sessionId → scope 上下文；会话关闭时用于判断分组是否还有其它存活会话在用。 */
+  const sessionCtxs = new Map<string, SessionScopeCtx>();
+
+  /**
+   * session 存活判定：有挂起的 SSE 即活；挂过 SSE 的断开后给宽限期；
+   * 从没挂过 SSE 的纯 POST 客户端按 idle TTL。死亡的 session 持有的分组
+   * 变孤儿（tabManager.isScopeLive），可被其它 session 接管。
+   */
+  const isSessionLive = (o: SessionScopeCtx): boolean => {
+    if (o.sseRes) return true;
+    if (o.sseEverOpened) return Date.now() - (o.sseClosedAt ?? o.lastSeen) < ORPHAN_GRACE_MS;
+    return Date.now() - o.lastSeen < IDLE_TTL_MS;
+  };
+  tabManager.isScopeLive = (key: string): boolean => {
+    const sep = key.indexOf("\u0000");
+    const client = key.slice(0, sep);
+    const thread = key.slice(sep + 1);
+    for (const o of sessionCtxs.values()) {
+      if (o.client !== client) continue;
+      const def = o.threadOverride ?? o.headerGroup ?? o.id;
+      if (o.usedThreads.has(thread) || def === thread) {
+        if (isSessionLive(o)) return true;
+      }
+    }
+    return false;
+  };
 
   const headerString = (req: http.IncomingMessage, name: string): string | undefined => {
     const value = req.headers[name];
@@ -636,20 +681,66 @@ export function createMcpHttpHandler(tabManager: TabManager) {
             ? clientInfo.name.trim()
             : "agent"),
         headerGroup: headerString(req, "x-bmcp-group"),
+        usedThreads: new Set(),
+        lastSeen: Date.now(),
+        sseEverOpened: false,
       };
       const created = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => {
           ctx.id = id;
           transports.set(id, created);
+          sessionCtxs.set(id, ctx);
         },
       });
       transport = created;
       created.onclose = () => {
-        if (created.sessionId) transports.delete(created.sessionId);
+        const sid = created.sessionId;
+        if (sid) {
+          transports.delete(sid);
+          sessionCtxs.delete(sid);
+        }
+        // 会话结束（客户端 DELETE / transport close）：对齐 ZCode closeSession，
+        // 把本 session 寻址过的分组的 tab 归还用户（页面保留）。若同名分组仍被
+        // 其它存活 session 寻址（共享稳定分组名的场景），则跳过不释放。
+        for (const thread of ctx.usedThreads) {
+          const shared = [...sessionCtxs.values()].some((o) => {
+            if (o.client !== ctx.client || !isSessionLive(o)) return false;
+            const def = o.threadOverride ?? o.headerGroup ?? o.id;
+            return o.usedThreads.has(thread) || def === thread;
+          });
+          if (shared) continue;
+          const scope: AgentScope = {
+            client: ctx.client,
+            thread,
+            ...(ctx.label ? { label: ctx.label } : {}),
+          };
+          execute({ method: "closeSession" }, scope)
+            .then((r) => {
+              if (r.ok) logger.info(`[mcp] session closed, released group ${ctx.client}/${thread}`);
+              else logger.warn(`[mcp] closeSession failed for ${thread}:`, r.error);
+            })
+            .catch((e) => logger.warn(`[mcp] closeSession error for ${thread}:`, e));
+        }
       };
       const server = createBrowserMcpServer(execute, ctx, tabManager);
       await server.connect(created);
+    }
+    // 存活信号维护：任何请求刷新 lastSeen；GET 请求是 standalone SSE 流，
+    // 其 res 关闭即客户端断开（close() 只 abort SSE，不发 DELETE）。
+    const sctx = sessionId ? sessionCtxs.get(sessionId) : undefined;
+    if (sctx) {
+      sctx.lastSeen = Date.now();
+      if (req.method === "GET") {
+        sctx.sseEverOpened = true;
+        sctx.sseRes = res;
+        res.on("close", () => {
+          if (sctx.sseRes === res) {
+            sctx.sseRes = undefined;
+            sctx.sseClosedAt = Date.now();
+          }
+        });
+      }
     }
     await transport.handleRequest(req, res, body);
   };
