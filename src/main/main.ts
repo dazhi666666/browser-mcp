@@ -260,6 +260,17 @@ app.whenReady().then(async () => {
     notifyBookmarks();
     return { bookmarked };
   });
+  ipcMain.handle("app:getLaunchAtLogin", () => app.getLoginItemSettings().openAtLogin);
+  ipcMain.handle("app:setLaunchAtLogin", (_e, enabled: boolean) => {
+    // 开发模式（非打包）下 execPath 是 electron.exe，需要把仓库根目录作为
+    // 启动参数才能拉起本应用；打包后 app.isPackaged 时不需要参数。
+    app.setLoginItemSettings({
+      openAtLogin: !!enabled,
+      path: process.execPath,
+      args: app.isPackaged ? [] : [app.getAppPath()],
+    });
+    return app.getLoginItemSettings().openAtLogin;
+  });
   ipcMain.handle("bookmarks:remove", (_e, id: string) => {
     const ok = bookmarkStore.remove(id);
     notifyBookmarks();

@@ -19,6 +19,9 @@ contextBridge.exposeInMainWorld("browserMcp", {
   toggleBookmark: (entry: { url: string; title: string; favicon?: string }) =>
     ipcRenderer.invoke("bookmarks:toggle", entry),
   removeBookmark: (id: string) => ipcRenderer.invoke("bookmarks:remove", id),
+  getLaunchAtLogin: () => ipcRenderer.invoke("app:getLaunchAtLogin"),
+  setLaunchAtLogin: (enabled: boolean) =>
+    ipcRenderer.invoke("app:setLaunchAtLogin", enabled),
   onTabsChanged: (cb: () => void) => ipcRenderer.on("tabs:changed", () => cb()),
   onAgentBusy: (cb: (busy: boolean) => void) =>
     ipcRenderer.on("agent:busy", (_e, busy: boolean) => cb(busy)),

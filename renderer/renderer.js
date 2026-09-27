@@ -406,6 +406,28 @@ function renderMenuPanel() {
   action("开发者工具", "F12", () => api.openDevTools());
   action("重新加载界面", "", () => location.reload());
   sep();
+  // 开机自动启动开关：勾选态由系统 login item 读回（Windows 注册表 Run 键）。
+  const loginBtn = document.createElement("button");
+  loginBtn.className = "paction";
+  const loginLabel = document.createElement("span");
+  loginLabel.textContent = "开机自动启动";
+  const loginMark = document.createElement("span");
+  loginMark.className = "kbd";
+  loginBtn.append(loginLabel, loginMark);
+  let loginOn = false;
+  const renderLoginMark = () => {
+    loginMark.textContent = loginOn ? "✓" : "";
+  };
+  api.getLaunchAtLogin().then((v) => {
+    loginOn = !!v;
+    renderLoginMark();
+  });
+  loginBtn.addEventListener("click", async () => {
+    loginOn = !!(await api.setLaunchAtLogin(!loginOn));
+    renderLoginMark();
+  });
+  panelBodyEl.append(loginBtn);
+  sep();
   action("清除浏览历史", "", async () => {
     await api.clearHistory();
     if (panelMode === "history") renderPanelBody();

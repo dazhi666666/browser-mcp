@@ -187,7 +187,9 @@ Edge 风格 chrome（88px = tab 条 40 + 导航栏 48；侧面板占右 340 时 
 - 新标签页（Edge NTP 风格）：新建/空 tab 的 about:blank 由 main 进程 `dom-ready`
   时注入收藏夹磁贴网格（favicon 圆角图标 + 标题，最多 12 个），点击即导航。
 - 右侧停靠面板（340px）：收藏夹列表 / 历史记录（按天分组 + 搜索 + 单条删除）/
-  菜单动作。**停靠而非浮层**——renderer 画在页面区的任何内容都会被 WebContentsView
+  菜单动作（含「开机自动启动」开关，`app.setLoginItemSettings`——Windows 写
+  注册表 Run 键；开发模式下拉起 `electron.exe + 仓库路径`）。**停靠而非浮层**
+  ——renderer 画在页面区的任何内容都会被 WebContentsView
   原生层遮住（早期下拉菜单底部被截就是这个原因），所以面板占位、页面让宽。
 - 跟随系统明暗色（`nativeTheme` → CSS `prefers-color-scheme` + overlay 颜色同步，
   NTP 磁贴页同样跟随）。
