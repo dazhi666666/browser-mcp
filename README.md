@@ -2,6 +2,48 @@
 
 把 ZCode 桌面端的内置浏览器 + 操控能力抽成独立 Electron 应用，其它 Agent（OpenCode、Claude Code 等）通过 MCP 操控。用户可在窗口中实时观看并手动介入。
 
+## 快速开始
+
+要求：Node ≥ 20（构建与 shim 用；浏览器运行时是 Electron 自带）。Windows/macOS/Linux 均可。
+
+```bash
+git clone https://github.com/dazhi666666/browser-mcp.git
+cd browser-mcp
+npm install        # 首次会下载 Electron 二进制（约 100MB）
+npm run dev        # tsc 构建 + 启动窗口
+```
+
+然后在 Agent 软件里把 `shim/index.mjs` 挂为 MCP server（stdio），以 OpenCode 的
+`opencode.json` 为例（路径换成你的克隆位置）：
+
+```json
+{
+  "mcp": {
+    "browser": {
+      "type": "local",
+      "command": ["node", "/path/to/browser-mcp/shim/index.mjs"],
+      "enabled": true,
+      "environment": {
+        "BROWSER_MCP_APP_CMD": "\"/path/to/browser-mcp/node_modules/electron/dist/electron\" \"/path/to/browser-mcp\""
+      }
+    }
+  }
+}
+```
+
+`BROWSER_MCP_APP_CMD` 可选：配上后 App 未运行时 shim 会自动拉起（等 20s），
+不配则需先手动 `npm run dev`。Electron 可执行文件路径：
+Windows = `node_modules/electron/dist/electron.exe`，
+macOS = `node_modules/electron/dist/Electron.app/Contents/MacOS/Electron`，
+Linux = `node_modules/electron/dist/electron`。
+
+验证接入：让 agent 调 `browser_navigate url=https://example.com`——窗口应出现
+该页面；或跑 `node scripts/smoke-shim.mjs`（App 需已启动）。
+
+支持 streamable-HTTP 的 client 可直连 `http://127.0.0.1:<port>/mcp`（Bearer
+token 与端口见 `~/.browser-mcp/server.json`）。更多 client 配置示例见下文
+「Agent 接入」。
+
 ## 架构
 
 ```
@@ -191,8 +233,10 @@ node scripts/make-icon.mjs    # 重新生成 assets/icon.ico（需 App 运行中
   截图报 "display surface not available"、CDP Input 事件被静默丢弃。已通过
   `disable-features` + `backgroundThrottling:false` 规避——不得移除。
 - **窗口最小化**：遮挡开关不覆盖"最小化"（页面仍标 hidden，Input 被丢）。
-  采用**假最小化**：`main.ts` 拦截 `minimize` 事件 → `restore()` + 停到屏幕外
-  （-32000），OS 仍认为窗口可见，agent 指令照常生效且窗口不弹回；
+  采用**假最小化**：`main.ts` 拦截 `minimize` 事件 → `restore()` + 停到当前
+  显示器右下角、只留 2×2 px 在屏内——肉眼不可见，但 viz 合成表面保持存活
+  （完全离屏 -32000 会丢表面，capturePage 报 UnknownVizError/挂起且不可恢复），
+  agent 指令照常生效且窗口不弹回；
   用户点任务栏图标经 `focus` 事件移回原位置（含 maximized 状态）。
   `browserVisibilitySet(false)` 同样走停靠而非 `hide()`。
 - **CDP session 态**：`debugger.attach` 后必须补发 `Page.enable`，否则 JS dialog
