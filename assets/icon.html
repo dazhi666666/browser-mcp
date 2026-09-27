@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; padding: 0; overflow: hidden; }
+      svg { display: block; }
+    </style>
+    <script>
+      // ?<size> 决定渲染尺寸，供截图脚本按 clip 精确截取
+      const s = Math.max(16, Math.min(1024, parseInt(location.search.slice(1), 10) || 256));
+      document.addEventListener("DOMContentLoaded", () => {
+        const svg = document.querySelector("svg");
+        svg.style.width = s + "px";
+        svg.style.height = s + "px";
+      });
+    </script>
+  </head>
+  <body>
+    <svg viewBox="0 0 256 256" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#3b5bfd" />
+          <stop offset="0.55" stop-color="#0f6cbd" />
+          <stop offset="1" stop-color="#0ea5a5" />
+        </linearGradient>
+        <linearGradient id="gl" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#ffffff" />
+          <stop offset="1" stop-color="#c8e6ff" />
+        </linearGradient>
+        <linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#ffffff" />
+          <stop offset="1" stop-color="#ffe58a" />
+        </linearGradient>
+      </defs>
+      <!-- 全出血底板（截图无 alpha，直角铺满） -->
+      <rect x="0" y="0" width="256" height="256" fill="url(#bg)" />
+      <!-- 顶部高光 -->
+      <ellipse cx="128" cy="18" rx="110" ry="42" fill="#ffffff" opacity="0.10" />
+      <!-- 地球：浏览器 -->
+      <g fill="none" stroke="url(#gl)" stroke-linecap="round">
+        <circle cx="124" cy="126" r="62" stroke-width="11" />
+        <ellipse cx="124" cy="126" rx="29" ry="62" stroke-width="8" />
+        <path d="M62 126h124" stroke-width="8" />
+        <path d="M72 97c15 8 32 12 52 12s37-4 52-12" stroke-width="8" />
+        <path d="M72 155c15-8 32-12 52-12s37 4 52 12" stroke-width="8" />
+      </g>
+      <!-- 光标箭头：agent 远程操控 -->
+      <path
+        d="M178 158 L228 183 L204 190 L197 214 Z"
+        fill="#ffffff"
+        stroke="#0b3d66"
+        stroke-width="6"
+        stroke-linejoin="round"
+      />
+      <!-- 小光点：智能闪光 -->
+      <path
+        d="M192 58 l7.5 19.5 19.5 7.5 -19.5 7.5 -7.5 19.5 -7.5 -19.5 -19.5 -7.5 19.5 -7.5 z"
+        fill="url(#spark)"
+      />
+    </svg>
+  </body>
+</html>

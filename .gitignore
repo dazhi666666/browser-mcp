@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+_ui*.png
+_*.ps1
+_*.mjs
+_*.cjs
+_*.sh
