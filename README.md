@@ -267,6 +267,9 @@ node scripts/make-icon.mjs    # 重新生成 assets/icon.ico（需 App 运行中
   renderer 按 groupId 切 run 渲染 chip——不要在 renderer 侧自行排序。
 - **分组持久性**：groupId=client\0thread 是运行时身份不落盘；重启后 tab 全是
   user tab，agent 重新寻址会再次隐式 claim。
+- **单实例**：`app.requestSingleInstanceLock()` 必须保留——重复启动（双击 / shim
+  拉起 / login item）产生的第二实例会因 userData profile 争用渲染成全白窗口；
+  `second-instance` 事件回调里用 `bringToFront` 把已有窗口唤回（含解除停靠态）。
 
 ## 未实现 / 后续
 

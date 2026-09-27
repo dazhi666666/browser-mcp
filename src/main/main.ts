@@ -142,7 +142,19 @@ async function writeDiscoveryFile(port: number): Promise<void> {
   );
 }
 
+// 单实例锁：第二个实例（双击图标 / shim 拉起 / login item 重复触发）直接退出，
+// 并让已有实例把窗口唤回前台。两个实例共享同一 userData profile（锁争用会
+// 让后启动的实例 chrome 渲染成全白窗口）。
+const singleInstance = app.requestSingleInstanceLock();
+let bringToFront: (() => void) | undefined;
+if (singleInstance) {
+  app.on("second-instance", () => bringToFront?.());
+} else {
+  app.quit();
+}
+
 app.whenReady().then(async () => {
+  if (!singleInstance) return;
   // 去掉 Electron 标识，避免站点按异常 UA 处理
   const ses = session.fromPartition("persist:browser-mcp");
   ses.setUserAgent(ses.getUserAgent().replace(/ Electron\/[\d.]+/, ""));
@@ -154,8 +166,8 @@ app.whenReady().then(async () => {
     height: 40,
   });
   const win = new BrowserWindow({
-    width: 1280,
-    height: 840,
+    width: 640,
+    height: 420,
     minWidth: 560,
     minHeight: 400,
     icon: join(__dirname, "../../assets/icon.ico"),
@@ -215,6 +227,14 @@ app.whenReady().then(async () => {
   win.once("ready-to-show", () => win.show());
   win.on("minimize", parkWindow);
   win.on("focus", unparkWindow);
+  // 第二实例试图启动时唤回本窗口（先解除屏幕外停靠，再正常前台化）
+  bringToFront = () => {
+    if (win.isDestroyed()) return;
+    unparkWindow();
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  };
   nativeTheme.on("updated", () => {
     if (!win.isDestroyed()) win.setTitleBarOverlay(overlayColors());
   });
@@ -260,16 +280,20 @@ app.whenReady().then(async () => {
     notifyBookmarks();
     return { bookmarked };
   });
-  ipcMain.handle("app:getLaunchAtLogin", () => app.getLoginItemSettings().openAtLogin);
+  // Windows login item：set 时传了 path/args，get 必须带相同参数才能正确读回
+  // openAtLogin（否则按空 args 比对永远 false）。开发模式 execPath 是
+  // electron.exe，需把仓库根目录作为启动参数；打包后不需要。
+  const loginItemOptions = () => ({
+    path: process.execPath,
+    args: app.isPackaged ? [] : [app.getAppPath()],
+  });
+  ipcMain.handle(
+    "app:getLaunchAtLogin",
+    () => app.getLoginItemSettings(loginItemOptions()).openAtLogin,
+  );
   ipcMain.handle("app:setLaunchAtLogin", (_e, enabled: boolean) => {
-    // 开发模式（非打包）下 execPath 是 electron.exe，需要把仓库根目录作为
-    // 启动参数才能拉起本应用；打包后 app.isPackaged 时不需要参数。
-    app.setLoginItemSettings({
-      openAtLogin: !!enabled,
-      path: process.execPath,
-      args: app.isPackaged ? [] : [app.getAppPath()],
-    });
-    return app.getLoginItemSettings().openAtLogin;
+    app.setLoginItemSettings({ openAtLogin: !!enabled, ...loginItemOptions() });
+    return app.getLoginItemSettings(loginItemOptions()).openAtLogin;
   });
   ipcMain.handle("bookmarks:remove", (_e, id: string) => {
     const ok = bookmarkStore.remove(id);

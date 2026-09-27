@@ -1052,8 +1052,8 @@ function NEW_TAB_SCRIPT(itemsJson: string): string {
   const css =
     "html,body{height:100%;margin:0;}" +
     "body{font:13px Segoe UI,Microsoft YaHei,sans-serif;background:#f9f9f9;color:#1f1f1f;" +
-    "display:flex;flex-direction:column;align-items:center;user-select:none;}" +
-    ".ntp{margin-top:14vh;max-width:760px;text-align:center;}" +
+    "display:flex;flex-direction:column;align-items:center;justify-content:center;user-select:none;}" +
+    ".ntp{max-width:760px;text-align:center;}" +
     ".grid{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;}" +
     "a.tile{display:flex;flex-direction:column;align-items:center;gap:8px;width:88px;" +
     "padding:12px 6px;border-radius:10px;text-decoration:none;color:inherit;}" +
