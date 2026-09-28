@@ -23,6 +23,8 @@ const AUTH_TOKEN = randomUUID();
 // Windows 遮挡检测会挂起被完全遮挡窗口的合成器与输入派发，
 // 导致 capturePage "display surface not available" 且 CDP Input 事件被丢弃。
 app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
+// 本机 GPU 合成不可用（窗口整窗白屏但 capturePage 正常）：禁用硬件加速走软件渲染
+app.disableHardwareAcceleration();
 
 let tabManager: TabManager;
 let mcpHandler: ReturnType<typeof createMcpHttpHandler>;

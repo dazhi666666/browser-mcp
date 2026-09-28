@@ -60,11 +60,14 @@ function maybeLaunchApp() {
   const mtime = existsSync(DISCOVERY_FILE) ? statSync(DISCOVERY_FILE).mtimeMs : 0;
   const stale = Date.now() - mtime > 60_000;
   log(`launching app via BROWSER_MCP_APP_CMD (discovery ${stale ? "stale" : "missing"})`);
+  const env = { ...process.env };
+  // Windows 上 ELECTRON_RUN_AS_NODE="" 仍会被 Electron 视为已设置（run-as-node），必须删除
+  delete env.ELECTRON_RUN_AS_NODE;
   const child = spawn(cmd, {
     shell: true,
     detached: true,
     stdio: "ignore",
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: "" },
+    env,
   });
   child.unref();
   return true;
@@ -119,8 +122,10 @@ function upstream() {
       (client) => {
         client.onerror = (error) => log("upstream error:", error);
         client.onclose = () => {
-          log("upstream closed; exiting");
-          process.exit(0);
+          // 上游会话断开（App 重启 / session idle TTL）不退出：
+          // 清掉缓存的 client，下个请求时重连（必要时重新拉起 App）
+          log("upstream closed; will reconnect on next request");
+          upstreamPromise = undefined;
         };
       },
       () => {},
