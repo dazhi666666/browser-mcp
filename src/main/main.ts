@@ -6,7 +6,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import electron from "electron";
 
-const { app, BrowserWindow, ipcMain, session, nativeTheme, screen } = electron;
+const { app, BrowserWindow, ipcMain, session, nativeTheme, screen, Tray, Menu } =
+  electron;
 import { browserCommandSchema } from "../shared/index.js";
 import { TabManager } from "./tabManager.js";
 import { createMcpHttpHandler } from "./mcpServer.js";
@@ -30,6 +31,8 @@ let tabManager: TabManager;
 let mcpHandler: ReturnType<typeof createMcpHttpHandler>;
 const historyStore = new HistoryStore(HISTORY_FILE);
 const bookmarkStore = new BookmarkStore(BOOKMARKS_FILE);
+let isQuitting = false;
+let tray: Electron.Tray | null = null;
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   const data = JSON.stringify(body);
@@ -237,6 +240,13 @@ app.whenReady().then(async () => {
     win.show();
     win.focus();
   };
+  // 点击关闭按钮时最小化到托盘，而不是退出进程
+  win.on("close", (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      parkWindow();
+    }
+  });
   nativeTheme.on("updated", () => {
     if (!win.isDestroyed()) win.setTitleBarOverlay(overlayColors());
   });
@@ -306,13 +316,52 @@ app.whenReady().then(async () => {
   await win.loadFile(join(__dirname, "../../renderer/index.html"));
   tabManager.newTab();
 
+  // 系统托盘：点击关闭/最小化后程序仍驻留后台，供 Agent 继续操控浏览器
+  tray = new Tray(join(__dirname, "../../assets/icon.ico"));
+  tray.setToolTip("Browser MCP");
+  const trayMenu = Menu.buildFromTemplate([
+    {
+      label: "显示浏览器",
+      click: () => {
+        if (win.isDestroyed()) return;
+        unparkWindow();
+        if (win.isMinimized()) win.restore();
+        win.show();
+        win.focus();
+      },
+    },
+    { type: "separator" },
+    {
+      label: "退出",
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+  tray.setContextMenu(trayMenu);
+  tray.on("click", () => {
+    if (win.isDestroyed()) return;
+    if (win.isVisible() && !parked) {
+      parkWindow();
+    } else {
+      unparkWindow();
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    }
+  });
+
   const port = await startControlServer(win);
   await writeDiscoveryFile(port);
   logger.info(`browser-mcp control server on http://127.0.0.1:${port}`);
 });
 
 app.on("window-all-closed", () => {
-  app.quit();
+  // 关闭窗口时只停靠到托盘，不退出；只有 tray 菜单“退出”或 before-quit 才真退出
+  if (isQuitting) {
+    app.quit();
+  }
 });
 
 app.on("will-quit", () => {
