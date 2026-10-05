@@ -16,7 +16,7 @@
  *   BROWSER_MCP_CLIENT    覆盖上报给 App 的 client 名（默认透传下游 clientInfo.name）
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -43,7 +43,17 @@ function readDiscovery() {
   }
 }
 
-async function healthy(port) {
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function healthy(port, pid) {
+  if (pid && !isPidAlive(pid)) return false;
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, {
       signal: AbortSignal.timeout(1_000),
@@ -60,6 +70,18 @@ function maybeLaunchApp() {
   const mtime = existsSync(DISCOVERY_FILE) ? statSync(DISCOVERY_FILE).mtimeMs : 0;
   const stale = Date.now() - mtime > 60_000;
   log(`launching app via BROWSER_MCP_APP_CMD (discovery ${stale ? "stale" : "missing"})`);
+  // 若已有 discovery 文件但 PID 已死，清理掉避免新 App 启动期间 shim 继续读到旧端口
+  if (existsSync(DISCOVERY_FILE)) {
+    try {
+      const d = JSON.parse(readFileSync(DISCOVERY_FILE, "utf8"));
+      if (d.pid && !isPidAlive(d.pid)) {
+        log("discovery points to a dead pid; removing stale server.json");
+        rmSync(DISCOVERY_FILE);
+      }
+    } catch {
+      // ignore malformed discovery
+    }
+  }
   const env = { ...process.env };
   // Windows 上 ELECTRON_RUN_AS_NODE="" 仍会被 Electron 视为已设置（run-as-node），必须删除
   delete env.ELECTRON_RUN_AS_NODE;
@@ -79,7 +101,7 @@ async function connectUpstream(clientName) {
   let lastError;
   for (;;) {
     const discovery = readDiscovery();
-    if (discovery && (await healthy(discovery.port))) {
+    if (discovery && (await healthy(discovery.port, discovery.pid))) {
       const headers = { authorization: `Bearer ${discovery.token}` };
       const group = process.env.BROWSER_MCP_GROUP?.trim();
       if (group) headers["x-bmcp-group"] = group;
