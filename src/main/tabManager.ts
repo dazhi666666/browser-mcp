@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import electron from "electron";
 import type {
   BrowserWindow,
+  DownloadItem,
   HandlerDetails,
   Referrer,
+  Session,
   WebContents,
   WebContentsView as WebContentsViewType,
 } from "electron";
@@ -87,6 +91,61 @@ function scopeKey(scope: AgentScope): string {
   return `${scope.client}\u0000${scope.thread}`;
 }
 
+const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
+
+/** Windows 文件名非法字符与首尾空白/点号清理。 */
+function sanitizeFilename(name: string): string {
+  const cleaned = name.replace(/[\\/:*?"<>|]/g, "_").replace(/^[\s.]+|[\s.]+$/g, "");
+  return cleaned || "download";
+}
+
+/** 从 URL 推断落盘文件名（pathname 末段；查不到就用 download）。 */
+function suggestFilename(url: string): string {
+  try {
+    return sanitizeFilename(decodeURIComponent(path.basename(new URL(url).pathname)));
+  } catch {
+    return "download";
+  }
+}
+
+/**
+ * session.downloadURL 落盘：走对应 session 的 cookie/代理/登录态，无需页内 fetch。
+ * resolve(DownloadItem) 于 completed；cancelled/interrupted/超时 reject。
+ */
+function sessionDownload(
+  session: Session,
+  url: string,
+  savePath: string,
+): Promise<DownloadItem> {
+  return new Promise((resolveDownload, rejectDownload) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      rejectDownload(new Error(`timed out after ${Math.round(DOWNLOAD_TIMEOUT_MS / 60_000)} min`));
+    }, DOWNLOAD_TIMEOUT_MS);
+    const onWillDownload = (_event: unknown, item: DownloadItem): void => {
+      // 本工具是该 session 唯一的程序化下载入口；并发调用各自注册，先到先得
+      session.removeListener("will-download", onWillDownload);
+      item.setSavePath(savePath);
+      item.once("done", (_e, state) => {
+        clearTimeout(timer);
+        if (state === "completed") resolveDownload(item);
+        else rejectDownload(new Error(`download ${state}: ${item.getFilename()}`));
+      });
+    };
+    const cleanup = (): void => {
+      session.removeListener("will-download", onWillDownload);
+    };
+    session.on("will-download", onWillDownload);
+    try {
+      session.downloadURL(url);
+    } catch (e) {
+      clearTimeout(timer);
+      cleanup();
+      rejectDownload(e instanceof Error ? e : new Error(String(e)));
+    }
+  });
+}
+
 /**
  * main 进程直接持有 WebContentsView 的 tab 管理器。
  * 替代 ZCode 的 browserGuestManager：webview 不再由 renderer 创建，
@@ -127,6 +186,35 @@ export class TabManager {
     private bookmarks?: BookmarkStore,
   ) {
     win.on("resize", () => this.layoutActive());
+    this.installAgentDownloadFallback();
+  }
+
+  /**
+   * will-download 兜底：agent 分组 tab 触发的下载（navigate 到附件 URL、页内点击下载链接）
+   * 不弹系统"另存为"对话框——agent 点不了原生对话框，下载会一直悬着——改为自动落入系统
+   * 下载目录，重名自动追加 (1)(2)。用户手工 tab（无分组）保持系统默认对话框行为。
+   * browser_download 工具的显式路径由它自己的监听器后置覆盖（同一事件内 listener 按注册
+   * 顺序同步执行，构造期注册的这个先跑），不受影响。
+   */
+  private installAgentDownloadFallback(): void {
+    const session = electron.session.fromPartition(SESSION_PARTITION);
+    session.on("will-download", (_event, item, webContents) => {
+      try {
+        if (item.getSavePath()) return; // 已被 browser_download 显式接管
+        const tab = this.findByWebContents(webContents);
+        if (!tab?.groupId) return; // 用户自己的 tab：保持系统对话框
+        const dir = electron.app.getPath("downloads");
+        const base = sanitizeFilename(item.getFilename() || suggestFilename(item.getURL()));
+        const ext = path.extname(base);
+        const stem = ext ? base.slice(0, base.length - ext.length) : base;
+        let target = path.join(dir, base);
+        for (let i = 1; fs.existsSync(target); i += 1) target = path.join(dir, `${stem} (${i})${ext}`);
+        item.setSavePath(target);
+        logger.info(`[download] agent tab auto-save: ${target}`);
+      } catch (e) {
+        logger.warn(`[download] fallback failed: ${e}`);
+      }
+    });
   }
 
   /** renderer 上报 chrome 实际布局：收藏夹栏显隐改变 top，侧面板开合改变 right。 */
@@ -539,6 +627,33 @@ export class TabManager {
       case "playwrightWaitForTimeout": {
         await sleep(command.timeoutMs);
         return finish({ ok: true });
+      }
+      case "download": {
+        // 指定 tabId 时用该 tab 的 session（分组可见性校验同其它命令）；
+        // 未指定时直接落到持久分区 session——cookie 都在 persist:browser-mcp，登录态可复用。
+        const tab = resolve(explicitTabId);
+        if (explicitTabId !== undefined && !tab) {
+          return wrongGroup(tab) ?? fail("execution_error", "no such tab");
+        }
+        const session = tab?.view.webContents.session ?? electron.session.fromPartition(SESSION_PARTITION);
+        const savePath = path.isAbsolute(command.path ?? "")
+          ? command.path!
+          : path.join(
+              electron.app.getPath("downloads"),
+              sanitizeFilename(path.basename(command.path ?? "") || suggestFilename(command.url)),
+            );
+        try {
+          fs.mkdirSync(path.dirname(savePath), { recursive: true });
+          const item = await sessionDownload(session, command.url, savePath);
+          let bytes = 0;
+          try { bytes = fs.statSync(savePath).size; } catch { /* item gone; report 0 */ }
+          return finish({
+            ok: true,
+            download: { path: savePath, bytes, mimeType: item.getMimeType(), filename: item.getFilename() },
+          });
+        } catch (e) {
+          return fail("execution_error", `download failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
       case "waitFor": {
         const tab = resolve(explicitTabId);

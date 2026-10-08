@@ -222,6 +222,26 @@ export function createBrowserMcpServer(
     { expression: z.string().min(1), tabId },
     (a) => ({ method: "evaluate", expression: a.expression, tabId: a.tabId }),
   );
+  reg(
+    "browser_download",
+    "Download a URL to a local file with the browser session's cookies (reuses institutional/library logins instead of in-page fetch). " +
+      "Returns download: { path, bytes, mimeType, filename }.",
+    {
+      url: z.string().min(1),
+      path: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Absolute target path, or a filename saved into the system Downloads folder; defaults to the URL's basename"),
+      tabId,
+    },
+    (a: { url: string; path?: string; tabId?: string }) => ({
+      method: "download",
+      url: a.url,
+      path: a.path,
+      tabId: a.tabId,
+    }),
+  );
 
   // ---- 交互 ----
   reg(

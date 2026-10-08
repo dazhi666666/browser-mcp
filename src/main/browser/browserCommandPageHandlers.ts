@@ -15,6 +15,8 @@ import { captureScreenshotWithCssPixelCorrection } from "./browserScreenshotCapt
 
 const ABORTED_NAVIGATION_CONFIRM_TIMEOUT_MS = 500;
 const ABORTED_NAVIGATION_POLL_INTERVAL_MS = 25;
+/** evaluate 结果截断阈值（字符数）：超过即降级为截断字符串，防止 MCP 消息体爆炸。 */
+const MAX_EVALUATE_RESULT_CHARS = 200_000;
 
 interface ScreenshotViewportMetrics {
   pageX?: number;
@@ -353,6 +355,12 @@ export async function handleEvaluate(
     }
   } else {
     value = raw.data;
+  }
+  // 大结果保护：MCP 消息体没有上限，页内抓取大文本/二进制容易撑爆传输。
+  // 超限就截断成字符串并标注原始体量，agent 需要完整内容时应在页内分片。
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  if (typeof s === "string" && s.length > MAX_EVALUATE_RESULT_CHARS) {
+    value = `${s.slice(0, MAX_EVALUATE_RESULT_CHARS)}…[truncated: result was ${s.length} chars; fetch in smaller slices]`;
   }
   return done({ ok: true, value });
 }

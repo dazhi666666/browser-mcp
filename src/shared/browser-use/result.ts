@@ -111,6 +111,16 @@ export const browserCommandResultSchema = z
     tab: browserTabSummarySchema.optional(),
     /** evaluate 返回：页面表达式的可 JSON 序列化结果。 */
     value: z.unknown().optional(),
+    /** download 返回：URL 经 session（带登录 cookie）下载落盘的结果。 */
+    download: z
+      .object({
+        path: z.string().min(1),
+        bytes: z.number().nonnegative(),
+        mimeType: z.string().optional(),
+        filename: z.string().optional(),
+      })
+      .strict()
+      .optional(),
     /** elementInfo 返回：坐标命中元素的信息（复用快照元素结构；未命中则省略）。 */
     element: browserSnapshotElementSchema.optional(),
     /** getDialog 返回：当前 JS 弹窗信息；无弹窗时为 null。 */

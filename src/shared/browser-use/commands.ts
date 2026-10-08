@@ -486,6 +486,16 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
       tabId: z.string().optional(),
     })
     .strict(),
+  // download：用目标 tab 所在 session（携带登录 cookie）下载 URL 到本地文件。
+  // path 缺省或为文件名时存入系统下载目录；绝对路径按原样使用。
+  z
+    .object({
+      method: z.literal("download"),
+      url: z.string().min(1),
+      path: z.string().min(1).optional(),
+      tabId: z.string().optional(),
+    })
+    .strict(),
   // getDialog：读取当前 JS 弹窗（alert/confirm/prompt/beforeunload）信息，无则返回 dialog=null。
   z.object({ method: z.literal("getDialog"), tabId: z.string().optional() }).strict(),
   // handleDialog：接受/取消当前 JS 弹窗；prompt 可带 promptText。

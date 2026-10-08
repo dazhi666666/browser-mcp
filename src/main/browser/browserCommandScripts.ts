@@ -193,14 +193,15 @@ export function ELEMENT_AT_POINT_SCRIPT(x: number, y: number): string {
 }
 
 /**
- * evaluate：包一层 (function(){ return (EXPR); })() 执行，并 JSON 安全序列化。
- * 成功可序列化→{ok:true,kind:'json',data}；不可序列化→{ok:true,kind:'str',data:String(v)}；
- * 异常→{ok:false,message}。页面脚本禁反引号与 ${}；EXPR 原样拼入（评估语义即为执行入参）。
+ * evaluate：包一层 async IIFE 执行，await 表达式结果（支持页内 async fetch 等异步取数），
+ * 再 JSON 安全序列化。成功可序列化→{ok:true,kind:'json',data}；不可序列化→{ok:true,kind:'str',data:String(v)}；
+ * 异常（含返回的 Promise reject）→{ok:false,message}。页面脚本禁反引号与 ${}；EXPR 原样拼入。
+ * 外层返回 Promise，由 webContents.executeJavaScript 等待 settle。
  */
 export function EVALUATE_SCRIPT(expression: string): string {
   return (
-    "(function(){try{" +
-    "var __v=(function(){ return (" +
+    "(async function(){try{" +
+    "var __v=await (async function(){ return (" +
     expression +
     "\n); })();" +
     "var __s;try{__s=JSON.stringify(__v);}catch(e){__s=undefined;}" +
