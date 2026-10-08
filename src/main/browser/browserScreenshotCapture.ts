@@ -81,6 +81,25 @@ function resolveScreenshotQualityScale(target: ScreenshotDimensions): number {
     : 1;
 }
 
+/**
+ * clip/fullPage 的用户倍率上限保护：raster = CSS × 显示 dsf(≤3) × scale，
+ * 超过 4096 边长 / 16.7MP 就压回（低于 1 时与旧行为一致取 1）。
+ */
+export function capQualityScale(
+  quality: number,
+  cssWidth: number,
+  cssHeight: number,
+): number {
+  const worstDsf = 3;
+  const capped = Math.min(
+    quality,
+    MAX_SCREENSHOT_RASTER_EDGE / (cssWidth * worstDsf),
+    MAX_SCREENSHOT_RASTER_EDGE / (cssHeight * worstDsf),
+    Math.sqrt(MAX_SCREENSHOT_RASTER_PIXELS / (cssWidth * cssHeight * worstDsf * worstDsf)),
+  );
+  return Number.isFinite(capped) && capped >= 1 ? Math.min(quality, capped) : 1;
+}
+
 async function resizeScreenshotToTarget(
   view: ControlledView,
   result: ScreenshotCaptureResult,

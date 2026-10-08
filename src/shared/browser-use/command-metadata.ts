@@ -93,6 +93,7 @@ export const browserCommandMethodSchema = z.enum([
   "elementInfo",
   "evaluate",
   "download",
+  "credentials",
   "getDialog",
   "handleDialog",
   "waitFor",

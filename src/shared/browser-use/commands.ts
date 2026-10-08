@@ -405,6 +405,8 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
       method: z.literal("screenshot"),
       ref: z.string().min(1).optional(),
       fullPage: z.boolean().optional(),
+      // 光栅密度倍率（相对显示缩放）：缺省 2 = 高清；1 = 经典 CSS 密度。
+      scale: z.number().int().min(1).max(3).optional(),
       // 区域截图：CDP Page.captureScreenshot 的 clip（视口 CSS px）。与 fullPage 互斥。
       clip: z
         .object({
@@ -493,6 +495,19 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
       method: z.literal("download"),
       url: z.string().min(1),
       path: z.string().min(1).optional(),
+      tabId: z.string().optional(),
+    })
+    .strict(),
+  // credentials：浏览器保存的登录凭据管理（登录表单提交时自动捕获，safeStorage 加密落盘）。
+  // list 不含密码；save 的 origin 缺省取目标 tab 的 origin；delete 按 id。
+  z
+    .object({
+      method: z.literal("credentials"),
+      action: z.enum(["list", "save", "delete"]),
+      origin: z.string().min(1).optional(),
+      username: z.string().min(1).optional(),
+      password: z.string().min(1).optional(),
+      id: z.string().min(1).optional(),
       tabId: z.string().optional(),
     })
     .strict(),

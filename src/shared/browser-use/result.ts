@@ -121,6 +121,28 @@ export const browserCommandResultSchema = z
       })
       .strict()
       .optional(),
+    /** credentials/list 返回：已保存的登录凭据（绝不含密码）。 */
+    credentials: z
+      .array(
+        z
+          .object({
+            id: z.string(),
+            origin: z.string(),
+            username: z.string(),
+            usernameField: z.string().optional(),
+            createdAt: z.number(),
+            lastUsedAt: z.number(),
+          })
+          .strict(),
+      )
+      .optional(),
+    /** credentials/save 返回：保存（或更新）后的条目标识。 */
+    saved: z
+      .object({ id: z.string(), origin: z.string(), username: z.string() })
+      .strict()
+      .optional(),
+    /** credentials/delete 返回：是否删除了条目。 */
+    removed: z.boolean().optional(),
     /** elementInfo 返回：坐标命中元素的信息（复用快照元素结构；未命中则省略）。 */
     element: browserSnapshotElementSchema.optional(),
     /** getDialog 返回：当前 JS 弹窗信息；无弹窗时为 null。 */

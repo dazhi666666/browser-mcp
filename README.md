@@ -162,7 +162,7 @@ Edge-style chrome (88px = 40px tab strip + 48px nav bar; when a side panel occup
 - Debug endpoint `GET /ui.png`: screenshots the chrome layer. Note that `WebContentsView` is a separate compositing layer not part of that document, so the page area appears blank in the screenshot — an inherent capturePage limitation, not a bug.
 - Window icon: `assets/icon.ico` (16–256 embedded PNGs). The design source is the SVG in `assets/icon.html` (globe + cursor arrow + sparkle); `scripts/make-icon.mjs` borrows a page in the running app to re-render each size and pack the ICO — file:// is blocked by navigation_blocked, so the script serves it over a temporary http server.
 
-## Tool surface (32)
+## Tool surface (34)
 
 - Navigation: `browser_navigate` `browser_back` `browser_forward` `browser_reload`
 - Reading: `browser_snapshot` (ref snapshot) `browser_dom_snapshot` (ARIA tree text) `browser_take_screenshot` (image content) `browser_get_state` `browser_element_info` `browser_evaluate`
@@ -170,11 +170,32 @@ Edge-style chrome (88px = 40px tab strip + 48px nav bar; when a side panel occup
 - Waiting: `browser_wait_for` `browser_wait` `browser_wait_for_load_state` `browser_wait_for_url`
 - Dialog: `browser_get_dialog` `browser_handle_dialog`
 - Tab/window: `browser_tabs` (list/new/activate/close/claim) `browser_resize` `browser_viewport_reset` `browser_set_visible` `browser_scope` (group get/set)
-- Advanced: `browser_locator` (Playwright selector + operation passthrough)
+- Advanced: `browser_locator` (Playwright selector + operation passthrough) `browser_download` (saves a URL with the session's cookies) `browser_credentials` (encrypted login store; login forms are captured and re-filled automatically)
 
 All tools accept an optional `group` parameter: overrides the thread identity for a single call (multiple threads sharing one MCP session can use it to keep their groups separate).
 
 Typical agent flow: `snapshot` (get e1..eN refs) → `click`/`fill`/`type` by ref → `screenshot` or `dom_snapshot` to verify.
+
+Screenshots default to HD raster (2x the display density, ~4x the pixels); `scale: 1` gives the
+classic CSS-density PNG, and `ref` captures a snapshot element's own bounding box.
+
+## Skill (control-browser)
+
+`skills/control-browser/` packages this tool surface into an agent skill: a `SKILL.md` with the
+snapshot→ref workflow plus a zero-dependency MCP client CLI (`scripts/browser.mjs`, plain Node >= 18)
+that auto-discovers `~/.browser-mcp/server.json` — no SDK or repo checkout needed on the agent side.
+
+```bash
+cp -r skills/control-browser ~/.agents/skills/   # user scope: ZCode + Codex both discover it
+# 或 ~/.zcode/skills/（仅 ZCode）
+node ~/.agents/skills/control-browser/scripts/browser.mjs status
+node ~/.agents/skills/control-browser/scripts/browser.mjs call browser_navigate '{"url":"https://example.com"}'
+node ~/.agents/skills/control-browser/scripts/browser.mjs call browser_take_screenshot --out shot.png
+```
+
+Each CLI call is a fresh process, so the script pins a stable tab group (`cli` by default;
+`--group`/`BROWSER_MCP_GROUP` to override) to keep tabs persistent across calls. stdio-only MCP
+clients (OpenCode etc.) can use `shim/index.mjs` instead.
 
 ## Smoke tests
 

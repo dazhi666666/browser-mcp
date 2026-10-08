@@ -12,6 +12,8 @@ import { browserCommandSchema } from "../shared/index.js";
 import { TabManager } from "./tabManager.js";
 import { createMcpHttpHandler } from "./mcpServer.js";
 import { HistoryStore, BookmarkStore } from "./userData.js";
+import { CredentialStore, safeStorageCipher } from "./credentials.js";
+import { restoreSessionCookies, startSessionCookieKeeper } from "./cookies.js";
 import { logger } from "./logger.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -31,6 +33,9 @@ let tabManager: TabManager;
 let mcpHandler: ReturnType<typeof createMcpHttpHandler>;
 const historyStore = new HistoryStore(HISTORY_FILE);
 const bookmarkStore = new BookmarkStore(BOOKMARKS_FILE);
+// ready 后构造（safeStorage 未 ready 时不可用）；will-quit 引用需要模块级绑定
+let credentialStore: CredentialStore;
+let cookieKeeper: ReturnType<typeof startSessionCookieKeeper>;
 let isQuitting = false;
 let tray: Electron.Tray | null = null;
 
@@ -164,6 +169,17 @@ app.whenReady().then(async () => {
   const ses = session.fromPartition("persist:browser-mcp");
   ses.setUserAgent(ses.getUserAgent().replace(/ Electron\/[\d.]+/, ""));
 
+  // 登录态持久化：会话 Cookie（登录密钥）退出即被 Chromium 清掉，启动先恢复
+  // 上次快照，再起守护（changed 防抖 2s + 5min 兜底）持续快照。
+  const cookieFile = join(DISCOVERY_DIR, "session-cookies.json");
+  await restoreSessionCookies(ses, cookieFile, safeStorageCipher());
+  cookieKeeper = startSessionCookieKeeper(ses, cookieFile, safeStorageCipher());
+  // 登录凭据（表单捕获）同样依赖 safeStorage，必须在 app ready 后构造
+  credentialStore = new CredentialStore(
+    join(DISCOVERY_DIR, "credentials.json"),
+    safeStorageCipher(),
+  );
+
   // Edge 风格：tab 条占满标题栏，右上角用 titleBarOverlay 的原生窗口按钮。
   const overlayColors = () => ({
     color: nativeTheme.shouldUseDarkColors ? "#1b1b1b" : "#dee1e6",
@@ -264,6 +280,7 @@ app.whenReady().then(async () => {
     { parkWindow, unparkWindow },
     historyStore,
     bookmarkStore,
+    credentialStore,
   );
   mcpHandler = createMcpHttpHandler(tabManager);
 
@@ -367,4 +384,7 @@ app.on("window-all-closed", () => {
 app.on("will-quit", () => {
   historyStore.flushSync();
   bookmarkStore.flushSync();
+  credentialStore.flushSync();
+  // 会话 Cookie 快照是异步的，尽力补一次（正常路径 changed 防抖 2s 已落盘）
+  void cookieKeeper.flushNow();
 });

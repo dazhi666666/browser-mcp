@@ -25,10 +25,11 @@ WSL 里测 Windows 侧 HTTP：用 `curl.exe`/`node.exe`（WSL 内网不到 Windo
 - `src/main/main.ts` — 窗口、HTTP 端点（/mcp、/command、/tabs、/history、/bookmarks、/health）、`~/.browser-mcp/server.json`
 - `src/main/tabManager.ts` — WebContentsView tab 管理 + manager 级命令分发 + 历史记录 + 动态 chrome 布局（唯一允许碰 Electron 的地方）
 - `src/main/userData.ts` — HistoryStore/BookmarkStore（`~/.browser-mcp/*.json` 持久化，不 import electron）
-- `src/main/mcpServer.ts` — MCP 工具注册（32 tools → BrowserCommand）+ /mcp sessionful 分发 + 每会话 AgentScope（clientInfo/headers → client+thread）
+- `src/main/mcpServer.ts` — MCP 工具注册（34 tools → BrowserCommand）+ /mcp sessionful 分发 + 每会话 AgentScope（clientInfo/headers → client+thread）
 - `src/main/browser/*` — 移植的页面 executor；只依赖 ControlledView，不许 import electron
 - `src/shared/*` — 移植的 zod 契约
 - `shim/index.mjs` — stdio→HTTP MCP 代理（纯 ESM，无构建）
+- `skills/control-browser/` — 给外部 agent 的技能：SKILL.md 工作流 + 零依赖 MCP CLI（`scripts/browser.mjs`，自动发现 server.json，默认固定 `cli` 分组）；改动工具面/工作流时同步更新
 - `renderer/` — Edge 风格 chrome UI（tab 条 40px + 导航栏 48px = `TOOLBAR_HEIGHT`，无构建直接 loadFile）
 
 ## 规则

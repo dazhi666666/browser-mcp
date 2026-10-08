@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import electron from "electron";
 import type {
   BrowserWindow,
@@ -19,9 +20,12 @@ import type {
 import { executeBrowserCommandOnView } from "./browser/browserCommandExecutor.js";
 import type { ControlledView } from "./browser/browserCommandTypes.js";
 import type { HistoryStore, BookmarkStore } from "./userData.js";
+import { CredentialStore, originOf } from "./credentials.js";
 import { logger } from "./logger.js";
 
 const { WebContentsView } = electron;
+/** dist/main 下的编译产物目录（guestPreload.cjs 与本文件同目录）。 */
+const MAIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 /** chrome 顶部默认高度：tab 条 40 + 导航栏 48；收藏夹栏显示时由 renderer 上报更新。 */
 export const TOOLBAR_HEIGHT = 88;
@@ -184,9 +188,11 @@ export class TabManager {
     private windowCtl?: { parkWindow: () => void; unparkWindow: () => void },
     private history?: HistoryStore,
     private bookmarks?: BookmarkStore,
+    private credentials?: CredentialStore,
   ) {
     win.on("resize", () => this.layoutActive());
     this.installAgentDownloadFallback();
+    this.installCredentialCapture();
   }
 
   /**
@@ -213,6 +219,34 @@ export class TabManager {
         logger.info(`[download] agent tab auto-save: ${target}`);
       } catch (e) {
         logger.warn(`[download] fallback failed: ${e}`);
+      }
+    });
+  }
+
+  /**
+   * guest preload 捕获的登录表单提交（见 guestPreload.cts）：sender 必须是本管理器的
+   * tab，origin 取自 preload 上报的 location.href（iframe 里的登录是它自己的 origin，
+   * 与主框架 URL 无关；preload 在隔离世界运行，页面伪造不了这条消息）。
+   */
+  private installCredentialCapture(): void {
+    electron.ipcMain.on("guest:credentials", (event, payload) => {
+      try {
+        if (!this.credentials || !this.findByWebContents(event.sender)) return;
+        const p = (payload ?? {}) as Record<string, unknown>;
+        const password = typeof p.password === "string" ? p.password.slice(0, 2048) : "";
+        const origin = originOf(typeof p.href === "string" ? p.href : "");
+        if (!password || !origin) return;
+        this.credentials.save({
+          origin,
+          username: typeof p.username === "string" ? p.username.slice(0, 512) : "",
+          password,
+          ...(typeof p.usernameField === "string" && p.usernameField
+            ? { usernameField: p.usernameField.slice(0, 128) }
+            : {}),
+        });
+        logger.info(`[credentials] saved login for ${origin}`);
+      } catch (e) {
+        logger.warn(`[credentials] capture failed: ${e}`);
       }
     });
   }
@@ -655,6 +689,40 @@ export class TabManager {
           return fail("execution_error", `download failed: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
+      case "credentials": {
+        if (!this.credentials) return fail("execution_error", "credential store unavailable");
+        if (command.action === "list") {
+          return finish({ ok: true, credentials: this.credentials.list() });
+        }
+        if (command.action === "delete") {
+          if (!command.id) return fail("invalid_command", "delete requires id");
+          return finish({ ok: true, removed: this.credentials.remove(command.id) });
+        }
+        // save：origin 缺省时取目标 tab（无 tabId 则当前 tab）的 origin。
+        if (!command.username || !command.password) {
+          return fail("invalid_command", "save requires username and password");
+        }
+        const origin = command.origin
+          ? originOf(command.origin)
+          : originOf(
+              safe(
+                () =>
+                  (explicitTabId ? resolve(explicitTabId) : this.activeTab())?.view.webContents.getURL() ??
+                  "",
+                "",
+              ),
+            );
+        if (!origin) return fail("invalid_command", "save requires origin (or a tab to derive it from)");
+        const saved = this.credentials.save({
+          origin,
+          username: command.username,
+          password: command.password,
+        });
+        return finish({
+          ok: true,
+          saved: { id: saved.id, origin: saved.origin, username: saved.username },
+        });
+      }
       case "waitFor": {
         const tab = resolve(explicitTabId);
         if (!tab) return wrongGroup(tab) ?? fail("execution_error", "no such tab");
@@ -778,6 +846,7 @@ export class TabManager {
     const view = new WebContentsView({
       webPreferences: {
         partition: SESSION_PARTITION,
+        preload: path.join(MAIN_DIR, "guestPreload.cjs"),
         contextIsolation: true,
         sandbox: true,
         nodeIntegration: false,
@@ -799,9 +868,10 @@ export class TabManager {
       refresh();
     });
     // 新标签页：about:blank 的 DOM 由 main 注入收藏夹磁贴（Edge NTP 风格）。
-    // dom-ready 对初始 about:blank 与显式导航都触发。
+    // dom-ready 对初始 about:blank 与显式导航都触发；网页页面上尝试回填已存凭据。
     wc.on("dom-ready", () => {
       if (safe(() => wc.getURL(), "") === "about:blank") this.renderNewTabPage(wc);
+      else this.credentials?.autofill(wc);
     });
     wc.on("did-navigate-in-page", (_e, url, isMainFrame) => {
       if (isMainFrame !== false) recordVisit(url);
@@ -1005,18 +1075,19 @@ export class TabManager {
           return wc.debugger.sendCommand(method, params as object | undefined, sessionId);
         },
       },
-      captureViewportScreenshot: async () => {
-        // 视图无合成表面时 capturePage 可能永不 resolve（曾观察到挂起 >70s），
-        // 超时兜底让命令快速失败而不是把请求挂死。
-        const image = await Promise.race([
-          wc.capturePage(),
-          new Promise<Electron.NativeImage>((_, reject) =>
-            setTimeout(() => reject(new Error("capturePage timed out")), 10_000),
-          ),
-        ]);
-        return image.isEmpty() ? undefined : image.toPNG().toString("base64");
-      },
+      captureViewportScreenshot: async () => this.capturePagePng(wc),
     };
+  }
+
+  /** capturePage 的超时兜底封装（视图无表面时可能永不 resolve）。 */
+  private async capturePagePng(wc: WebContents): Promise<string | undefined> {
+    const image = await Promise.race([
+      wc.capturePage(),
+      new Promise<Electron.NativeImage>((_, reject) =>
+        setTimeout(() => reject(new Error("capturePage timed out")), 10_000),
+      ),
+    ]);
+    return image.isEmpty() ? undefined : image.toPNG().toString("base64");
   }
 
   /** 在 about:blank 上注入新标签页：收藏夹磁贴网格。 */

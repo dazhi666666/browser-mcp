@@ -11,12 +11,14 @@ import {
 import type { ControlledView } from "./browserCommandTypes.js";
 import type { BrowserCommandDone } from "./browserCommandResult.js";
 import { executionError } from "./browserCommandResult.js";
-import { captureScreenshotWithCssPixelCorrection } from "./browserScreenshotCapture.js";
+import { captureScreenshotWithCssPixelCorrection, capQualityScale } from "./browserScreenshotCapture.js";
 
 const ABORTED_NAVIGATION_CONFIRM_TIMEOUT_MS = 500;
 const ABORTED_NAVIGATION_POLL_INTERVAL_MS = 25;
 /** evaluate 结果截断阈值（字符数）：超过即降级为截断字符串，防止 MCP 消息体爆炸。 */
 const MAX_EVALUATE_RESULT_CHARS = 200_000;
+/** screenshot 的默认光栅密度倍率（相对显示缩放）。 */
+const DEFAULT_SCREENSHOT_SCALE = 2;
 
 interface ScreenshotViewportMetrics {
   pageX?: number;
@@ -234,12 +236,106 @@ export async function handleGetState(
   return done({ ok: true, state });
 }
 
+/** 快照 ref → 文档坐标矩形（__zcodeRefs 由 SNAPSHOT_SCRIPT 维护；ref 失效返回 null）。 */
+async function resolveSnapshotRefRect(
+  view: ControlledView,
+  ref: string,
+): Promise<{ x: number; y: number; width: number; height: number } | null> {
+  try {
+    const rect = (await view.webContents.executeJavaScript(
+      "(function(){var m=window.__zcodeRefs;var el=m&&m.get(" +
+        JSON.stringify(ref) +
+        ");if(!el||!el.isConnected)return null;var r=el.getBoundingClientRect();" +
+        "return {x:r.x+window.scrollX,y:r.y+window.scrollY,width:r.width,height:r.height};})()",
+    )) as { x?: unknown; y?: unknown; width?: unknown; height?: unknown } | null;
+    if (
+      !rect ||
+      typeof rect.x !== "number" ||
+      typeof rect.y !== "number" ||
+      typeof rect.width !== "number" ||
+      typeof rect.height !== "number"
+    ) {
+      return null;
+    }
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  } catch {
+    return null;
+  }
+}
+
 export async function handleScreenshot(
   view: ControlledView,
   command: Extract<BrowserCommand, { method: "screenshot" }>,
   done: BrowserCommandDone,
 ): Promise<BrowserCommandResult> {
+  // 光栅密度倍率（相对显示缩放）：默认 2 = 高清（约 4 倍像素），1 = 经典 CSS 密度。
+  const quality = command.scale ?? DEFAULT_SCREENSHOT_SCALE;
+  if (command.ref) {
+    // 元素截图：快照 ref → 文档矩形 → CDP clip（输出密度 = scale × 显示缩放）。
+    const rect = await resolveSnapshotRefRect(view, command.ref);
+    if (!rect) {
+      return done({
+        ok: false,
+        error: {
+          code: "ref_not_found",
+          message: `unknown snapshot ref: ${command.ref} (take a fresh browser_snapshot)`,
+        },
+      });
+    }
+    if (rect.width <= 0 || rect.height <= 0) {
+      return done({
+        ok: false,
+        error: { code: "execution_error", message: "element has an empty bounding box" },
+      });
+    }
+    const res = await captureScreenshotWithCssPixelCorrection(view, {
+      format: "png",
+      captureBeyondViewport: true,
+      clip: {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        scale: capQualityScale(quality, rect.width, rect.height),
+      },
+    });
+    if (!res?.data) {
+      return done({
+        ok: false,
+        error: { code: "execution_error", message: "screenshot returned empty data" },
+      });
+    }
+    return done({
+      ok: true,
+      image: { base64: res.data, mimeType: "image/png" },
+      state: readState(view.webContents),
+    });
+  }
   if (command.clip === undefined && command.fullPage !== true && view.captureViewportScreenshot) {
+    if (quality > 1) {
+      // 提密度只能靠 CDP 重渲染：capturePage 读的是窗口合成表面，密度固定跟随
+      // 显示缩放，Emulation dsf 覆盖不影响它。clip 取可视区 CSS 矩形（含滚动偏移），
+      // 输出密度 = scale × 显示缩放；CDP 失败（如表面挂起）回退 1x capturePage。
+      try {
+        const cssViewport = resolveScreenshotCssViewport(await readScreenshotLayoutMetrics(view));
+        if (cssViewport) {
+          const res = await captureScreenshotWithCssPixelCorrection(view, {
+            format: "png",
+            captureBeyondViewport: true,
+            clip: { ...cssViewport, scale: quality },
+          });
+          if (res?.data) {
+            return done({
+              ok: true,
+              image: { base64: res.data, mimeType: "image/png" },
+              state: readState(view.webContents),
+            });
+          }
+        }
+      } catch {
+        // 回退到经典路径
+      }
+    }
     const data = await view.captureViewportScreenshot();
     if (!data) {
       return done({
@@ -267,13 +363,13 @@ export async function handleScreenshot(
     captureBeyondViewport: command.clip !== undefined || command.fullPage === true,
   };
   if (command.clip) {
-    // 区域截图：clip 用视口 CSS px，scale:1 保证与坐标同系。
+    // 区域截图：clip 用视口 CSS px；CDP 输出密度 = scale × 显示缩放。
     params.clip = {
       x: command.clip.x,
       y: command.clip.y,
       width: command.clip.width,
       height: command.clip.height,
-      scale: 1,
+      scale: capQualityScale(quality, command.clip.width, command.clip.height),
     };
   } else if (command.fullPage === true) {
     // 全页截图：取 contentSize（优先 CSS 尺寸），用 clip 覆盖整页。
@@ -284,10 +380,11 @@ export async function handleScreenshot(
         y: typeof cs.y === "number" ? cs.y : 0,
         width: cs.width,
         height: cs.height,
-        scale: 1,
+        scale: capQualityScale(quality, cs.width, cs.height),
       };
     }
   } else if (cssViewport) {
+    // normalize 宿主有自己的 CSS 目标校正机制，保持 scale:1 不动。
     params.clip = { ...cssViewport, scale: 1 };
   }
 

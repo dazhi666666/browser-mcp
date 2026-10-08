@@ -203,7 +203,7 @@ Edge 风格 chrome（88px = tab 条 40 + 导航栏 48；侧面板占右 340 时 
   SVG（地球 + 光标箭头 + 闪光），`scripts/make-icon.mjs` 借运行中的 App 页面对
   每个尺寸重渲染后封装 ICO——file:// 会被 navigation_blocked 拦，脚本内置临时 http。
 
-## 工具面（32 个）
+## 工具面（34 个）
 
 - 导航：`browser_navigate` `browser_back` `browser_forward` `browser_reload`
 - 读取：`browser_snapshot`（ref 快照）`browser_dom_snapshot`（ARIA 树文本）
@@ -214,13 +214,32 @@ Edge 风格 chrome（88px = tab 条 40 + 导航栏 48；侧面板占右 340 时 
 - Dialog：`browser_get_dialog` `browser_handle_dialog`
 - Tab/窗口：`browser_tabs`（list/new/activate/close/claim）`browser_resize`
   `browser_viewport_reset` `browser_set_visible` `browser_scope`（分组 get/set）
-- 高级：`browser_locator`（Playwright selector + operation 透传）
+- 高级：`browser_locator`（Playwright selector + operation 透传）`browser_download`（借 session cookie 落盘下载）`browser_credentials`（加密登录凭据库；登录表单自动捕获、回填）
 
 所有工具接受可选 `group` 参数：单次调用覆盖 thread 身份（共享同一 MCP session 的
 多线程可借此保持分组独立）。
 
 典型 agent 流：`snapshot`（拿 e1..eN ref）→ `click`/`fill`/`type` by ref → `screenshot` 或
 `dom_snapshot` 复核。
+
+截图默认高清光栅（显示密度的 2 倍，约 4 倍像素）；`scale: 1` 回到经典 CSS 密度，
+`ref` 可只截快照元素自己的包围盒。
+
+## 技能（control-browser）
+
+`skills/control-browser/` 把工具面打包成 agent 技能：`SKILL.md`（snapshot→ref 工作流）+
+零依赖 MCP 客户端 CLI（`scripts/browser.mjs`，只要 Node >= 18），自动发现
+`~/.browser-mcp/server.json`，agent 侧不需要 SDK 或本仓库源码。
+
+```bash
+cp -r skills/control-browser ~/.agents/skills/   # 用户级：ZCode / Codex 都会发现
+node ~/.agents/skills/control-browser/scripts/browser.mjs status
+node ~/.agents/skills/control-browser/scripts/browser.mjs call browser_navigate '{"url":"https://example.com"}'
+node ~/.agents/skills/control-browser/scripts/browser.mjs call browser_take_screenshot --out shot.png
+```
+
+CLI 每次调用都是新进程，脚本默认固定 tab 分组（`cli`；可用 `--group`/`BROWSER_MCP_GROUP`
+覆盖）让 tab 跨调用复用。只支持 stdio 的 MCP client（OpenCode 等）请用 `shim/index.mjs`。
 
 ## 冒烟测试
 

@@ -183,11 +183,18 @@ export function createBrowserMcpServer(
   );
   reg(
     "browser_take_screenshot",
-    "Take a PNG screenshot of the page viewport (optionally full page / clip region / element ref)",
+    "Take a PNG screenshot of the page viewport (optionally full page / clip region / element ref). Default raster is 2x display density (HD); pass scale:1 for the classic CSS-density capture.",
     {
       tabId,
       ref: z.string().optional(),
       fullPage: z.boolean().optional(),
+      scale: z
+        .number()
+        .int()
+        .min(1)
+        .max(3)
+        .optional()
+        .describe("Raster density multiplier over the display scale; default 2 (HD)"),
       clip: z
         .object({
           x: z.number(),
@@ -202,6 +209,7 @@ export function createBrowserMcpServer(
       method: "screenshot",
       ref: a.ref,
       fullPage: a.fullPage,
+      scale: a.scale,
       clip: a.clip,
       tabId: a.tabId,
     }),
@@ -239,6 +247,37 @@ export function createBrowserMcpServer(
       method: "download",
       url: a.url,
       path: a.path,
+      tabId: a.tabId,
+    }),
+  );
+  reg(
+    "browser_credentials",
+    "Manage the browser's saved login credentials. Login form submissions are captured automatically and stored encrypted " +
+      "(safeStorage); saved entries are auto-filled into empty login forms on the same origin. " +
+      "action=list returns entries WITHOUT passwords; action=save stores {username, password} for an origin " +
+      "(defaults to the current tab's origin); action=delete removes an entry by id.",
+    {
+      action: z.enum(["list", "save", "delete"]),
+      origin: z.string().min(1).optional().describe("Origin or hostname; save only"),
+      username: z.string().min(1).optional().describe("save only"),
+      password: z.string().min(1).optional().describe("save only"),
+      id: z.string().min(1).optional().describe("Entry id; delete only"),
+      tabId,
+    },
+    (a: {
+      action: "list" | "save" | "delete";
+      origin?: string;
+      username?: string;
+      password?: string;
+      id?: string;
+      tabId?: string;
+    }) => ({
+      method: "credentials",
+      action: a.action,
+      origin: a.origin,
+      username: a.username,
+      password: a.password,
+      id: a.id,
       tabId: a.tabId,
     }),
   );
