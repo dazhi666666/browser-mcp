@@ -26,6 +26,9 @@ const AUTH_TOKEN = randomUUID();
 // Windows 遮挡检测会挂起被完全遮挡窗口的合成器与输入派发，
 // 导致 capturePage "display surface not available" 且 CDP Input 事件被丢弃。
 app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
+// AutomationControlled 会把 navigator.webdriver 置 true（Cloudflare 等据此判
+// 机器人）。Electron 正常运行不开自动化特性，这里显式关掉兜底。
+app.commandLine.appendSwitch("disable-blink-features", "AutomationControlled");
 // 本机 GPU 合成不可用（窗口整窗白屏但 capturePage 正常）：禁用硬件加速走软件渲染
 app.disableHardwareAcceleration();
 
@@ -38,6 +41,10 @@ let credentialStore: CredentialStore;
 let cookieKeeper: ReturnType<typeof startSessionCookieKeeper>;
 let isQuitting = false;
 let tray: Electron.Tray | null = null;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   const data = JSON.stringify(body);
@@ -165,9 +172,41 @@ if (singleInstance) {
 
 app.whenReady().then(async () => {
   if (!singleInstance) return;
-  // 去掉 Electron 标识，避免站点按异常 UA 处理
+  // 站点风控（Elsevier CPE00001 / Cloudflare）把带自动化标识的 UA 当机器人：
+  // Electron 默认 UA 是 "... Gecko) browser-mcp/0.1.0 Chrome/146.0.x.x Electron/… Safari/…"
+  // （应用名/版本取自 package.json）。清掉 browser-mcp 与 Electron token，版本号
+  // 折成 Chrome 的 reduced 形态（146.0.0.0），得到与普通 Chrome 一致的 UA；
+  // userAgentFallback 让之后新建的 session 也默认干净。
+  const chromeUA = session.defaultSession
+    .getUserAgent()
+    .replace(
+      new RegExp(`${escapeRegExp(app.getName())}/${escapeRegExp(app.getVersion())}\\s*`),
+      "",
+    )
+    .replace(/\s+Electron\/[\d.]+/, "")
+    .replace(/Chrome\/(\d+)\.\d+\.\d+\.\d+/, "Chrome/$1.0.0.0");
+  app.userAgentFallback = chromeUA;
   const ses = session.fromPartition("persist:browser-mcp");
-  ses.setUserAgent(ses.getUserAgent().replace(/ Electron\/[\d.]+/, ""));
+  ses.setUserAgent(chromeUA);
+  // 兜底：已注册的 service worker 等请求面不随 setUserAgent 更新，出现自动化
+  // 标识时按特征改写；顺带把 sec-ch-ua 品牌对齐 Chrome——UA 写 Chrome 而品牌
+  // 列表写 Chromium 是风控可比对的矛盾信号（Electron 只报 Chromium 品牌）。
+  const chromeMajor = /Chrome\/(\d+)/.exec(chromeUA)?.[1];
+  const chromeBrands = chromeMajor
+    ? `"Google Chrome";v="${chromeMajor}", "Chromium";v="${chromeMajor}", "Not=A?Brand";v="24"`
+    : undefined;
+  ses.webRequest.onBeforeSendHeaders((details, callback) => {
+    const headers = details.requestHeaders;
+    for (const key of Object.keys(headers)) {
+      const lower = key.toLowerCase();
+      if (lower === "user-agent" && /electron|browser-mcp/i.test(headers[key])) {
+        headers[key] = chromeUA;
+      } else if (lower === "sec-ch-ua" && chromeBrands) {
+        headers[key] = chromeBrands;
+      }
+    }
+    callback({ requestHeaders: headers });
+  });
 
   // 登录态持久化：会话 Cookie（登录密钥）退出即被 Chromium 清掉，启动先恢复
   // 上次快照，再起守护（changed 防抖 2s + 5min 兜底）持续快照。
