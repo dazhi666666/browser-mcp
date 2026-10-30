@@ -1,3 +1,6 @@
+// [bmcp-sync] 本文件复制自 ZCode packages/shared/src/browser-use/result.ts（sync a60ba6a7）。
+// 同步上游更新：整文件覆盖后，全局搜 "[bmcp-ext]" 重贴本地扩展
+// （orphanTabs / download / credentials / saved / removed）。
 import { z } from "zod";
 import { browserErrorCodeSchema, browserPageStateSchema } from "./commands.js";
 import { browserViewportSizeSchema } from "./command-metadata.js";
@@ -95,6 +98,10 @@ export type BrowserRecordingJob = z.infer<typeof browserRecordingJobSchema>;
 export const browserCommandResultSchema = z
   .object({
     ok: z.boolean(),
+    scope: z
+      .object({ id: z.string().min(1), state: z.enum(["open", "released", "absent", "rejected"]) })
+      .strict()
+      .optional(),
     state: browserPageStateSchema.optional(),
     snapshot: browserSnapshotSchema.optional(),
     image: z
@@ -105,13 +112,13 @@ export const browserCommandResultSchema = z
     tabs: z.array(browserTabSummarySchema).optional(),
     /** BrowserUser.openTabs() 返回；与当前 session 自有 tabs.list() 严格分离。 */
     userTabs: z.array(browserUserTabInfoSchema).optional(),
-    /** 属主 session 已死的分组 tab（孤儿）；可被任意存活 scope 显式 claim 接管。 */
+    // [bmcp-ext] 属主 session 已死的分组 tab（孤儿）；可被任意存活 scope 显式 claim 接管。
     orphanTabs: z.array(browserUserTabInfoSchema).optional(),
     /** newTab 返回的单个真实 tab。 */
     tab: browserTabSummarySchema.optional(),
     /** evaluate 返回：页面表达式的可 JSON 序列化结果。 */
     value: z.unknown().optional(),
-    /** download 返回：URL 经 session（带登录 cookie）下载落盘的结果。 */
+    // [bmcp-ext] download 返回：URL 经 session（带登录 cookie）下载落盘的结果。
     download: z
       .object({
         path: z.string().min(1),
@@ -121,7 +128,7 @@ export const browserCommandResultSchema = z
       })
       .strict()
       .optional(),
-    /** credentials/list 返回：已保存的登录凭据（绝不含密码）。 */
+    // [bmcp-ext] credentials/list 返回：已保存的登录凭据（绝不含密码）。
     credentials: z
       .array(
         z
@@ -136,12 +143,12 @@ export const browserCommandResultSchema = z
           .strict(),
       )
       .optional(),
-    /** credentials/save 返回：保存（或更新）后的条目标识。 */
+    // [bmcp-ext] credentials/save 返回：保存（或更新）后的条目标识。
     saved: z
       .object({ id: z.string(), origin: z.string(), username: z.string() })
       .strict()
       .optional(),
-    /** credentials/delete 返回：是否删除了条目。 */
+    // [bmcp-ext] credentials/delete 返回：是否删除了条目。
     removed: z.boolean().optional(),
     /** elementInfo 返回：坐标命中元素的信息（复用快照元素结构；未命中则省略）。 */
     element: browserSnapshotElementSchema.optional(),

@@ -34,6 +34,12 @@ const DEBUGGER_PROTOCOL = "1.3";
 const WAIT_FOR_POLL_INTERVAL_MS = 100;
 const DEFAULT_WAIT_FOR_TIMEOUT_MS = 5_000;
 const DIALOG_AUTO_DISMISS_MS = 60_000;
+// 常量与下游管线（sendGuestCdpCommand 系 / ensureGuestCdpAttached / releaseGuestCdpAfterIdle）
+// 均自 ZCode browserGuestManager 原样移植：命令空闲即主动 detach debugger，命令期再恢复式
+// 重挂。Google 登录等风控 JS 会探测 CDP 会话（Runtime.enable 侧信道），挂载状态下直接报
+// 「此浏览器或应用可能不安全」；空闲 detach 后页面看到的就是干净 Chromium。
+const DEFAULT_GUEST_CDP_IDLE_RELEASE_MS = 1_500;
+const DEFAULT_GUEST_CDP_TEARDOWN_TIMEOUT_MS = 1_000;
 
 /**
  * Agent 身份作用域：client = agent 软件（MCP clientInfo.name / x-bmcp-client），
@@ -53,6 +59,34 @@ export interface TabGroupInfo {
   label: string;
   color: string;
 }
+
+/**
+ * 控制作用域记录——字段与上游 controlScopes 的 value 同形（context/closed/released/
+ * pending/closing）。移植自 ZCode packages/desktop/src/main/browserView/browserGuestManager.ts
+ * （sync a60ba6a7，releaseControlScope/controlScopes），以下为本仓库的固有差异，后续对
+ * 上游 diff 时只看这些点：
+ * 1. 上游 scope id 由 Host 生成并随每条命令的 context.controlScopeId 携带；本仓库 id 即
+ *    thread id，后续命令以 per-call `group: <id>` 寻址，tab 落进 groupKey 对应的分组。
+ * 2. 身份边界：上游 sameScope 比对完整 context；本仓库等价判定是「callerKey 命中
+ *    groupKey（scope 本人）或 openerKey（开 scope 的父线程）」，其它身份一律拒绝。
+ * 3. 释放后记录保留为 tombstone（closed+released）：同 id 迟到的 open 被拒绝，不能复活
+ *    资源。查无记录的 release 直接返回 absent、**不留 tombstone**——上游 Host 只会下发
+ *    已发行 id，「release 先于 open 注册」的竞态在本仓库不存在（id 只能来自成功的 open
+ *    响应），乱留 tombstone 反而会把同名普通分组永久打死。
+ */
+interface ControlScope {
+  /** 开 scope 时的调用方 scope（上游以 context 冻结身份；openerKey = scopeKey(context)）。 */
+  context: AgentScope;
+  openerKey: string;
+  groupKey: string;
+  closed: boolean;
+  released: boolean;
+  /** 已准入、尚未落地的命令；release 前必须等它们全部结束（对齐上游 scope.pending）。 */
+  pending: Set<Promise<void>>;
+  /** 释放 flight；并发 release 共享同一结果（对齐上游 scope.closing）。 */
+  closing?: Promise<BrowserCommandResult>;
+}
+
 
 export interface TabSummary {
   tabId: string;
@@ -75,6 +109,14 @@ interface ManagedTab {
   isLoading: boolean;
   /** CDP Emulation.setDeviceMetricsOverride 生效中的 CSS viewport override。 */
   viewportOverride?: { width: number; height: number };
+  /** 是否已挂载调试器；空闲释放置 false，恢复式重挂置回 true（对齐 ZCode 同名段）。 */
+  cdpAttached: boolean;
+  /** 尚未 settle 的 debugger.sendCommand 数量，teardown 会等待其归零或超时。 */
+  pendingCdpCommands: number;
+  /** 命令流空闲释放的计时器；每次 CDP 命令完成后重置，clearGuestCdpIdleRelease 时清除。 */
+  guestCdpIdleTimer?: ReturnType<typeof setTimeout>;
+  /** re-attach 会话态恢复 flight；业务命令必须 await 它完成才能派发（串行屏障）。 */
+  guestCdpRestoreFlight?: Promise<void>;
   /** 归属的 agent 分组；undefined = 用户手开的 tab（可被任一 scope claim）。 */
   groupId?: string;
 }
@@ -173,6 +215,8 @@ export class TabManager {
   private groups = new Map<string, TabGroupInfo>();
   /** 每个 scope 最近使用的 tab（无显式 tabId 的命令落点，对应 ZCode 的 active/defaultTabByScope）。 */
   private lastTabByScope = new Map<string, string>();
+  /** 控制作用域注册表：scope id → 记录（含 tombstone）。 */
+  private readonly controlScopes = new Map<string, ControlScope>();
   /**
    * mcpServer 注入：scopeKey 对应的分组属主 session 是否仍存活。
    * MCP 客户端不发 DELETE 就断开时（进程退出/断网），其分组的 tab 变为
@@ -189,6 +233,8 @@ export class TabManager {
     private history?: HistoryStore,
     private bookmarks?: BookmarkStore,
     private credentials?: CredentialStore,
+    // 命令级空闲释放阈值（对齐上游同名构造参数）；测试可注入更短值。
+    private readonly cdpIdleReleaseMs: number = DEFAULT_GUEST_CDP_IDLE_RELEASE_MS,
   ) {
     win.on("resize", () => this.layoutActive());
     this.installAgentDownloadFallback();
@@ -292,6 +338,8 @@ export class TabManager {
       view: this.createView(),
       controlled: undefined as unknown as ControlledView,
       isLoading: false,
+      cdpAttached: false,
+      pendingCdpCommands: 0,
     };
     tab.controlled = this.buildControlledView(tab);
     this.tabs.set(tabId, tab);
@@ -498,6 +546,7 @@ export class TabManager {
     }
     this.tabs.delete(tabId);
     this.clearDialogState(tabId);
+    this.clearGuestCdpIdleRelease(tab);
     tab.view.webContents.close();
     const next = this.tabs.keys().next().value;
     if (next && !this.activeTabId) this.activate(next);
@@ -543,7 +592,145 @@ export class TabManager {
 
   // ---------------------------------------------------------------- command dispatch
 
+  /** 命令生效 group 命中的控制作用域（scope id 即 thread id，见 ControlScope 注释）。 */
+  private controlScopeFor(scope: AgentScope): ControlScope | undefined {
+    const key = scopeKey(scope);
+    for (const rec of this.controlScopes.values()) {
+      if (rec.groupKey === key) return rec;
+    }
+    return undefined;
+  }
+
+  /** 调用方是否为该 scope 的合法控制者（上游 sameScope 的等价判定，见 ControlScope 注释 §2）。 */
+  private static scopeCallerAllowed(rec: ControlScope, callerKey: string): boolean {
+    return callerKey === rec.groupKey || callerKey === rec.openerKey;
+  }
+
+  /**
+   * releaseScope（上游 releaseControlScope 原样移植）：标记关闭屏障 → 等已准入命令落地 →
+   * 按 closeTabs 关闭或释放该 scope 名下 tab。查无记录直接返回 absent、不留 tombstone——
+   * 见 ControlScope 注释 §3。
+   */
+  private async releaseControlScope(
+    scope: AgentScope,
+    closeTabs: boolean,
+  ): Promise<BrowserCommandResult> {
+    const id = scope.thread;
+    const rec = this.controlScopes.get(id);
+    const result = (state: "released" | "absent"): BrowserCommandResult => ({
+      ok: true,
+      elapsedMs: 0,
+      scope: { id, state },
+    });
+    if (!rec) return result("absent");
+    if (!TabManager.scopeCallerAllowed(rec, scopeKey(scope)))
+      return {
+        ok: false,
+        elapsedMs: 0,
+        error: {
+          code: "execution_error",
+          message: "Browser scope identity mismatch",
+          sideEffect: "none",
+        },
+      };
+    if (rec.released) return result("released");
+    rec.closed = true;
+    const current = rec;
+    current.closing ??= (async () => {
+      // 上游在此先 abort 录制与 runningRequests；本仓库无 per-scope 请求注册表，
+      // 在途命令以 scope.pending 计。等已准入命令真正落地后再释放 tab，
+      // 避免它们在关闭后创建或重新绑定资源。
+      await Promise.all(current.pending);
+      const gid = current.groupKey;
+      for (const tab of [...this.tabs.values()]) {
+        if (tab.groupId !== gid) continue;
+        if (closeTabs) this.close(tab.tabId);
+        else this.releaseFromGroup(tab);
+      }
+      this.lastTabByScope.delete(gid);
+      current.released = true;
+      return result("released");
+    })().catch((error) => {
+      current.closing = undefined;
+      throw error;
+    });
+    return current.closing;
+  }
+
   async execute(scope: AgentScope, command: BrowserCommand): Promise<BrowserCommandResult> {
+    // ---- 控制作用域门禁：结构与上游 execute() 的 scope gating 块逐行对齐（reject 助手、
+    // 校验顺序、消息文案一致），差异仅 id 的来源（ControlScope 注释 §1）：上游随命令携带
+    // context.controlScopeId，本仓库取 scope.thread——命中的是已发行 id 即视为对该 scope
+    // 操作（open=幂等重开 / release=释放），否则 open 发行新 id。命中在册 scope 的其余
+    // 命令：已关闭 → 拒绝；在册 → 包进 pending，release 等它落地。
+    if (
+      command.method === "openScope" ||
+      command.method === "releaseScope" ||
+      this.controlScopeFor(scope)
+    ) {
+      const registered = this.controlScopes.get(scope.thread);
+      const id =
+        command.method === "openScope" ? (registered ? scope.thread : randomUUID()) : scope.thread;
+      const reject = (message: string): BrowserCommandResult => ({
+        ok: false,
+        elapsedMs: 0,
+        ...(command.method === "openScope" ? { scope: { id, state: "rejected" as const } } : {}),
+        error: { code: "backend_unavailable", message, sideEffect: "none" },
+      });
+      if (command.method === "releaseScope")
+        return this.releaseControlScope(scope, command.closeTabs === true);
+      const rec = registered ?? this.controlScopes.get(id);
+      if (rec && (!TabManager.scopeCallerAllowed(rec, scopeKey(scope)) || rec.closed))
+        return reject("Browser control scope is closed or belongs to another owner");
+      if (command.method === "openScope") {
+        // 上游在此校验 getBackendIdentity 代次（Host 转发桥防伪）；本仓库 mcpServer 是
+        // 唯一入口、无转发桥，代次校验不适用。
+        this.controlScopes.set(
+          id,
+          rec ?? {
+            context: scope,
+            openerKey: scopeKey(scope),
+            groupKey: scopeKey({ client: scope.client, thread: id }),
+            closed: false,
+            released: false,
+            pending: new Set(),
+          },
+        );
+        // 预建分组：scope 一打开 tab 条上就有落点（独立版：分组即作用域的 tab 落点）。
+        this.groupFor({ client: scope.client, thread: id });
+        return { ok: true, elapsedMs: 0, scope: { id, state: "open" } };
+      }
+      if (!rec) return reject("Browser control scope was not opened");
+    }
+    const ctrl = this.controlScopeFor(scope);
+    if (ctrl && (ctrl.closed || ctrl.released)) {
+      return {
+        ok: false,
+        elapsedMs: 0,
+        error: {
+          code: "backend_unavailable",
+          message: "Browser control scope is closed or belongs to another owner",
+          sideEffect: "none",
+        },
+      };
+    }
+    if (!ctrl) return this.dispatch(scope, command);
+    // 手写 settled promise（项目 lib 目标不含 Promise.withResolvers）：命令落地前挂进
+    // scope.pending（对齐上游 execute 的 scope?.pending 屏障），release 等它归零才动 tab。
+    let settlePending!: () => void;
+    const pendingGate = new Promise<void>((resolve) => {
+      settlePending = resolve;
+    });
+    ctrl.pending.add(pendingGate);
+    try {
+      return await this.dispatch(scope, command);
+    } finally {
+      ctrl.pending.delete(pendingGate);
+      settlePending();
+    }
+  }
+
+  private async dispatch(scope: AgentScope, command: BrowserCommand): Promise<BrowserCommandResult> {
     const startedAt = Date.now();
     const finish = (
       partial: Omit<BrowserCommandResult, "elapsedMs">,
@@ -744,12 +931,11 @@ export class TabManager {
         if (!this.pendingDialogs.has(tab.tabId)) {
           return fail("execution_error", "no pending JavaScript dialog for this tab");
         }
-        await tab.view.webContents.debugger
-          .sendCommand("Page.handleJavaScriptDialog", {
-            accept: command.accept,
-            ...(command.promptText !== undefined ? { promptText: command.promptText } : {}),
-          })
-          .catch((error) => logger.warn(`handleJavaScriptDialog failed: ${error}`));
+        // 空闲释放后 debugger 可能已 detach：走 sendGuestCdpCommand 恢复式重挂再应答。
+        await this.sendGuestCdpCommand(tab, tab.view.webContents, "Page.handleJavaScriptDialog", {
+          accept: command.accept,
+          ...(command.promptText !== undefined ? { promptText: command.promptText } : {}),
+        }).catch((error) => logger.warn(`handleJavaScriptDialog failed: ${error}`));
         this.clearDialogState(tab.tabId);
         return finish({ ok: true });
       }
@@ -757,7 +943,8 @@ export class TabManager {
         const tab = resolve(explicitTabId);
         if (!tab) return wrongGroup(tab) ?? fail("execution_error", "no such tab");
         tab.viewportOverride = { width: command.width, height: command.height };
-        await tab.view.webContents.debugger.sendCommand("Emulation.setDeviceMetricsOverride", {
+        // 走 sendGuestCdpCommand：空闲释放期会先恢复式重挂 + viewport 重放。
+        await this.sendGuestCdpCommand(tab, tab.view.webContents, "Emulation.setDeviceMetricsOverride", {
           width: command.width,
           height: command.height,
           // 可见 surface 仍由 view bounds 管理；CDP 只负责 CSS viewport。
@@ -771,9 +958,9 @@ export class TabManager {
         const tab = resolve(explicitTabId);
         if (!tab) return wrongGroup(tab) ?? fail("execution_error", "no such tab");
         tab.viewportOverride = undefined;
-        await tab.view.webContents.debugger
-          .sendCommand("Emulation.clearDeviceMetricsOverride")
-          .catch(() => undefined);
+        await this.sendGuestCdpCommand(tab, tab.view.webContents, "Emulation.clearDeviceMetricsOverride").catch(
+          () => undefined,
+        );
         return finish({ ok: true });
       }
       // ---- 会话/生命周期元命令 ----
@@ -808,8 +995,12 @@ export class TabManager {
       }
       case "closeSession": {
         // 会话结束：本组 tab 全部归还为用户 tab（页面保留，分组解散）。
+        // closeTabs: true 时真正关闭（对齐上游 closeSession({ closeTabs: true })——
+        // 只给永不回来认领的 session 用，比如一次性子代理）。
         for (const tab of this.tabs.values()) {
-          if (tab.groupId === scopeKey(scope)) this.releaseFromGroup(tab);
+          if (tab.groupId !== scopeKey(scope)) continue;
+          if (command.closeTabs === true) this.close(tab.tabId);
+          else this.releaseFromGroup(tab);
         }
         this.lastTabByScope.delete(scopeKey(scope));
         return finish({ ok: true });
@@ -854,7 +1045,6 @@ export class TabManager {
       },
     });
     const wc = view.webContents;
-    this.attachDebugger(wc);
 
     const tabIdHolder = { tabId: "" };
     const refresh = () => this.onChanged();
@@ -920,6 +1110,7 @@ export class TabManager {
     wc.on("destroyed", () => {
       const entry = this.findByWebContents(wc);
       if (entry) {
+        this.clearGuestCdpIdleRelease(entry);
         this.tabs.delete(entry.tabId);
         if (this.activeTabId === entry.tabId) this.activeTabId = undefined;
         this.onChanged();
@@ -942,6 +1133,8 @@ export class TabManager {
             : {}),
         });
         // 没有 agent 处理时不能无限挂起页面：超时自动 dismiss。
+        // 事件只在 CDP 挂载期到达（挂载即接管 JS dialog），此时必已 attached，
+        // 直接 raw 发送并重置空闲计时。
         const timer = setTimeout(() => {
           if (this.pendingDialogs.has(tabId)) {
             logger.warn(`auto-dismissing stale JS dialog tabId=${tabId}`);
@@ -949,6 +1142,8 @@ export class TabManager {
               .sendCommand("Page.handleJavaScriptDialog", { accept: false })
               .catch(() => undefined);
             this.clearDialogState(tabId);
+            const entry = this.findByWebContents(wc);
+            if (entry) this.scheduleGuestCdpIdleRelease(entry);
           }
         }, DIALOG_AUTO_DISMISS_MS);
         this.dialogDismissTimers.set(tabId, timer);
@@ -1070,10 +1265,8 @@ export class TabManager {
         executeJavaScript: (script) => wc.executeJavaScript(script, true),
       },
       cdp: {
-        send: (method, params, sessionId) => {
-          this.attachDebugger(wc);
-          return wc.debugger.sendCommand(method, params as object | undefined, sessionId);
-        },
+        send: (method, params, sessionId) =>
+          this.sendGuestCdpCommand(tab, wc, method, params, sessionId),
       },
       captureViewportScreenshot: async () => this.capturePagePng(wc),
     };
@@ -1098,17 +1291,186 @@ export class TabManager {
       .catch((e) => logger.warn(`new tab page inject failed: ${e}`));
   }
 
-  private attachDebugger(wc: WebContents): void {
-    if (wc.isDestroyed() || wc.debugger.isAttached()) return;
+  // ---------------------------------------------------------------------------
+  // CDP 管线（自 ZCode browserGuestManager 原样移植，guest → wc 一处符号适配）：
+  // sendGuestCdpCommand → （必要时）ensureGuestCdpAttached 恢复式重挂 → sendGuestCdpCommandRaw；
+  // 每条命令 finally 里 pendingCdpCommands-- 并 scheduleGuestCdpIdleRelease，空闲即 detach。
+  // ---------------------------------------------------------------------------
+
+  /** 恢复命令专用发送：只做 pending 计数与下发，不触发 ensure（避免自等待死锁）。 */
+  private async sendGuestCdpCommandRaw(
+    tab: ManagedTab,
+    wc: WebContents,
+    method: string,
+    params?: unknown,
+    sessionId?: string,
+  ): Promise<unknown> {
+    tab.pendingCdpCommands += 1;
     try {
-      wc.debugger.attach(DEBUGGER_PROTOCOL);
-      // 裸 attach 得到的是干净 session：Page.enable 缺失会让 JS dialog 事件黑洞、
-      // evaluate 遇到 dialog 挂起。必须补发（参照 ZCode guestManager 的恢复契约）。
-      void wc.debugger.sendCommand("Page.enable").catch((error) => {
-        logger.warn(`Page.enable failed: ${error}`);
+      const result = await wc.debugger.sendCommand(method, params as object | undefined, sessionId);
+      if (!sessionId && tab.view.webContents === wc && wc.getZoomFactor() !== 1) {
+        // renderer 的归一化回调可能被 Electron 后续 page zoom 传播覆盖。
+        // 固定 viewport 的设置和 CDP 重连都必须在同一执行边界恢复 guest zoom。
+        if (method === "Emulation.setDeviceMetricsOverride") wc.setZoomFactor(1);
+      }
+      return result;
+    } finally {
+      tab.pendingCdpCommands = Math.max(0, tab.pendingCdpCommands - 1);
+      this.scheduleGuestCdpIdleRelease(tab);
+    }
+  }
+
+  private async sendGuestCdpCommand(
+    tab: ManagedTab,
+    wc: WebContents,
+    method: string,
+    params?: unknown,
+    sessionId?: string,
+  ): Promise<unknown> {
+    // 命令空闲 1.5s 后 CDP 已主动释放（Google 登录等风控 JS 探测 CDP 即拒登；
+    // 同时消除 guest 销毁路径上的主进程 UAF 窗口），命令路径在此恢复式 re-attach
+    // 并 await 会话态重放完成（显式串行屏障：Page.enable / viewport override
+    // 先于本命令被 Chromium 处理）。
+    if (!safe(() => wc.debugger.isAttached(), false) || tab.guestCdpRestoreFlight) {
+      await this.ensureGuestCdpAttached(tab, wc);
+    }
+    return this.sendGuestCdpCommandRaw(tab, wc, method, params, sessionId);
+  }
+
+  /**
+   * CDP session 态恢复式 attach：idle 释放后再次进入命令期时调用，
+   * 返回可等待的 flight——Page.enable 与 viewport override 重放完成后业务命令才允许派发。
+   *
+   * Page 域 enable 与 Emulation.setDeviceMetricsOverride 都是 per-session 的，
+   * detach 时已被 Chromium 清空；裸 attach("1.3") 得到的是干净 session——dialog 事件
+   * 黑洞（getDialog 恒 null、evaluate 遇 JS dialog 挂到超时实测 62s）、viewport 仿真与
+   * manager 缓存分叉。恢复命令经 raw 发送（不走 ensure，避免自等待）。
+   */
+  private async ensureGuestCdpAttached(tab: ManagedTab, wc: WebContents): Promise<void> {
+    if (!tab.guestCdpRestoreFlight) {
+      const flight = this.runGuestCdpSessionRestore(tab, wc).finally(() => {
+        if (tab.guestCdpRestoreFlight === flight) tab.guestCdpRestoreFlight = undefined;
       });
+      tab.guestCdpRestoreFlight = flight;
+    }
+    await tab.guestCdpRestoreFlight;
+  }
+
+  private async runGuestCdpSessionRestore(tab: ManagedTab, wc: WebContents): Promise<void> {
+    if (!safe(() => wc.debugger.isAttached(), false)) {
+      wc.debugger.attach(DEBUGGER_PROTOCOL);
+      tab.cdpAttached = safe(() => wc.debugger.isAttached(), false);
+      if (!tab.cdpAttached) {
+        throw new Error(`browser guest cdp restore attach failed tabId=${tab.tabId}`);
+      }
+    }
+    // 恢复失败必须上抛：屏障契约是「Page.enable 与 viewport 状态就绪后才允许业务命令
+    // 派发」。吞掉异常会让后续命令见 attached 即跳过恢复——Page.enable 丢失把 dialog
+    // 事件黑洞延长到整个 attach 期。异常上抛前先 rollback 到 detached：半途 session
+    // 不可用，还原释放态后下一次命令才会重建恢复 flight。
+    try {
+      await this.sendGuestCdpCommandRaw(tab, wc, "Page.enable");
     } catch (error) {
-      logger.warn(`debugger attach failed: ${error}`);
+      logger.warn(`browser guest Page.enable replay failed tabId=${tab.tabId}: ${error}`);
+      this.rollbackGuestCdpRestore(tab, wc);
+      throw error;
+    }
+    const viewport = tab.viewportOverride;
+    if (viewport) {
+      // ZCode 经 enqueueViewportMutation 串行队列重放；独立版没有该队列，直接重放
+      // （sendGuestCdpCommandRaw 不触发 ensure，无自等待死锁）。
+      try {
+        await this.sendGuestCdpCommandRaw(tab, wc, "Emulation.setDeviceMetricsOverride", {
+          width: viewport.width,
+          height: viewport.height,
+          deviceScaleFactor: 1,
+          mobile: false,
+          dontSetVisibleSize: true,
+        });
+      } catch (error) {
+        logger.warn(`browser guest viewport replay failed tabId=${tab.tabId}: ${error}`);
+        this.rollbackGuestCdpRestore(tab, wc);
+        throw error;
+      }
+    }
+    logger.debug(`[cdp] session state replayed tabId=${tab.tabId} pageEnable=1`);
+  }
+
+  /** 恢复失败时把半途 session 还原为释放态；rollback 自身的失败不得掩盖原始错误。 */
+  private rollbackGuestCdpRestore(tab: ManagedTab, wc: WebContents): void {
+    try {
+      if (wc.debugger.isAttached()) wc.debugger.detach();
+    } catch {
+      // session 可能已销毁；cdpAttached 复位仍需完成。
+    }
+    tab.cdpAttached = false;
+  }
+
+  /**
+   * 命令级空闲释放：每次 CDP 命令完成后重置计时，超过 cdpIdleReleaseMs 无新命令即主动
+   * detach。Google 登录页等风控 JS 探测到 CDP 会话即拒登（上游另用于消除 guest renderer
+   * 被杀时的主进程 UAF 窗口）；命令间隙与手动浏览期保持 detach，页面看到的就是干净
+   * Chromium。密集命令流间隔远小于阈值，不会被误打断。
+   */
+  private scheduleGuestCdpIdleRelease(tab: ManagedTab): void {
+    if (tab.guestCdpIdleTimer) clearTimeout(tab.guestCdpIdleTimer);
+    tab.guestCdpIdleTimer = setTimeout(() => {
+      tab.guestCdpIdleTimer = undefined;
+      void this.releaseGuestCdpAfterIdle(tab, "cdp idle");
+    }, this.cdpIdleReleaseMs);
+  }
+
+  private clearGuestCdpIdleRelease(tab: ManagedTab): void {
+    if (tab.guestCdpIdleTimer) {
+      clearTimeout(tab.guestCdpIdleTimer);
+      tab.guestCdpIdleTimer = undefined;
+    }
+  }
+
+  private async waitForGuestCdpIdle(tab: ManagedTab, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (tab.pendingCdpCommands > 0 && Date.now() < deadline) {
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, Math.min(10, deadline - Date.now())),
+      );
+    }
+    return tab.pendingCdpCommands === 0;
+  }
+
+  private async releaseGuestCdpAfterIdle(
+    tab: ManagedTab,
+    reason: string,
+    requireReleased = false,
+  ): Promise<void> {
+    const wc = tab.view.webContents;
+    // 在途 CDP 命令（playwright cdp.send / viewport override / dialog 处理）结束后再断开，
+    // 避免中途拆掉正在使用的管线；超时兜底与 teardown 共用同一预算。
+    const settled = await this.waitForGuestCdpIdle(tab, DEFAULT_GUEST_CDP_TEARDOWN_TIMEOUT_MS);
+    if (!settled) {
+      logger.warn(
+        `[cdp] guest cdp release pending timeout tabId=${tab.tabId} ` +
+          `pending=${tab.pendingCdpCommands} reason=${reason}`,
+      );
+    }
+    if (this.tabs.get(tab.tabId) !== tab) return;
+    if (tab.pendingCdpCommands > 0) {
+      if (requireReleased) throw new Error("Browser CDP commands are still running");
+      return;
+    }
+    if (safe(() => wc.isDestroyed(), true)) return;
+    try {
+      if (!wc.debugger.isAttached()) {
+        tab.cdpAttached = false;
+        return;
+      }
+      wc.debugger.detach();
+      if (requireReleased && wc.debugger.isAttached())
+        throw new Error("Browser CDP is still attached");
+      tab.cdpAttached = false;
+      logger.debug(`[cdp] released after ${reason} tabId=${tab.tabId}`);
+    } catch (error) {
+      logger.warn(`[cdp] guest cdp release failed tabId=${tab.tabId} reason=${reason}: ${error}`);
+      if (requireReleased) throw error;
     }
   }
 

@@ -1,3 +1,5 @@
+// [bmcp-sync] 本文件复制自 ZCode packages/shared/src/browser-use/command-metadata.ts（sync a60ba6a7）。
+// 同步上游更新：整文件覆盖后，全局搜 "[bmcp-ext]" 重贴本地扩展（download / credentials 枚举项）。
 import { z } from "zod";
 
 /** 内置自由尺寸与 Agent viewport API 共用同一组 CSS px 安全边界。 */
@@ -92,6 +94,7 @@ export const browserCommandMethodSchema = z.enum([
   "getState",
   "elementInfo",
   "evaluate",
+  // [bmcp-ext]
   "download",
   "credentials",
   "getDialog",
@@ -116,6 +119,8 @@ export const browserCommandMethodSchema = z.enum([
   "markDeliverable",
   "markHandoff",
   "nameSession",
+  "openScope",
+  "releaseScope",
   "turnEnded",
   "closeSession",
   "cancelRequest",

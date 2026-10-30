@@ -1,4 +1,6 @@
 /* eslint-disable max-lines -- BrowserCommand 的 Zod discriminated union 必须保持单一运行时事实源，拆分会让协议方法与 schema 漂移。 */
+// [bmcp-sync] 本文件复制自 ZCode packages/shared/src/browser-use/commands.ts（sync a60ba6a7）。
+// 同步上游更新：整文件覆盖后，全局搜 "[bmcp-ext]" 重贴本地扩展（scale / download / credentials）。
 import { z } from "zod";
 import { browserViewportInputSchema } from "./command-metadata.js";
 
@@ -405,8 +407,6 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
       method: z.literal("screenshot"),
       ref: z.string().min(1).optional(),
       fullPage: z.boolean().optional(),
-      // 光栅密度倍率（相对显示缩放）：缺省 2 = 高清；1 = 经典 CSS 密度。
-      scale: z.number().int().min(1).max(3).optional(),
       // 区域截图：CDP Page.captureScreenshot 的 clip（视口 CSS px）。与 fullPage 互斥。
       clip: z
         .object({
@@ -417,6 +417,8 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
         })
         .strict()
         .optional(),
+      // [bmcp-ext] 光栅密度倍率（相对显示缩放）：缺省 2 = 高清；1 = 经典 CSS 密度。
+      scale: z.number().int().min(1).max(3).optional(),
       tabId: z.string().optional(),
     })
     .strict(),
@@ -488,7 +490,7 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
       tabId: z.string().optional(),
     })
     .strict(),
-  // download：用目标 tab 所在 session（携带登录 cookie）下载 URL 到本地文件。
+  // [bmcp-ext] download：用目标 tab 所在 session（携带登录 cookie）下载 URL 到本地文件。
   // path 缺省或为文件名时存入系统下载目录；绝对路径按原样使用。
   z
     .object({
@@ -498,8 +500,8 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
       tabId: z.string().optional(),
     })
     .strict(),
-  // credentials：浏览器保存的登录凭据管理（登录表单提交时自动捕获，safeStorage 加密落盘）。
-  // list 不含密码；save 的 origin 缺省取目标 tab 的 origin；delete 按 id。
+  // [bmcp-ext] credentials：浏览器保存的登录凭据管理（登录表单提交时自动捕获，safeStorage
+  // 加密落盘）。list 不含密码；save 的 origin 缺省取目标 tab 的 origin；delete 按 id。
   z
     .object({
       method: z.literal("credentials"),
@@ -602,8 +604,12 @@ export const browserCommandSchema = z.discriminatedUnion("method", [
       deliverable: z.boolean().optional(),
     })
     .strict(),
+  z.object({ method: z.literal("openScope") }).strict(),
+  z.object({ method: z.literal("releaseScope"), closeTabs: z.boolean().optional() }).strict(),
   z.object({ method: z.literal("turnEnded"), turnId: z.string().min(1).optional() }).strict(),
-  z.object({ method: z.literal("closeSession") }).strict(),
+  // closeTabs：连同该 session 名下的 tab 一起关（含已释放回该 session 的）。只给永不回来认领的
+  // session 用——dwf 子代理（docs/browser-use/2026-07-14-browser-tab-conversation-isolation-spec.md §2.3）。
+  z.object({ method: z.literal("closeSession"), closeTabs: z.boolean().optional() }).strict(),
   z.object({ method: z.literal("cancelRequest"), requestId: z.string().min(1) }).strict(),
   // close：关闭指定受控 tab（tabId 缺省=当前 tab）。manager 层处理：detach + 通知 renderer 卸载 webview。
   z.object({ method: z.literal("close"), tabId: z.string().optional() }).strict(),

@@ -543,20 +543,67 @@ export function createBrowserMcpServer(
       description:
         "Inspect or rename this session's tab group. Tabs created by different " +
         "agent threads are grouped separately in the tab strip; call with " +
-        "action=set to give this session a stable group name/label.",
+        "action=set to give this session a stable group name/label. " +
+        "action=open allocates an ephemeral control scope (subagent workspace): " +
+        "pass its id as the `group` argument on subsequent calls to route them " +
+        "into it; action=release closes that scope (optionally closing its tabs) " +
+        "and bars late opens from reviving it.",
       inputSchema: {
-        action: z.enum(["get", "set"]),
+        action: z.enum(["get", "set", "open", "release"]),
         group: z.string().optional().describe("new thread/group id for this session"),
         name: z.string().optional().describe("display label for the group"),
+        scopeId: z
+          .string()
+          .optional()
+          .describe("control scope id to release (from a previous action=open)"),
+        closeTabs: z
+          .boolean()
+          .optional()
+          .describe("action=release: also close the scope's tabs (default: release them as user tabs)"),
       },
     } as never,
-    (async (a: { action: "get" | "set"; group?: string; name?: string }) => {
+    (async (a: {
+      action: "get" | "set" | "open" | "release";
+      group?: string;
+      name?: string;
+      scopeId?: string;
+      closeTabs?: boolean;
+    }) => {
       if (a.action === "set") {
         const from = scopeFor();
         if (a.group) ctx.threadOverride = a.group.trim() || ctx.threadOverride;
         if (a.name) ctx.label = a.name.trim() || ctx.label;
         const to = scopeFor();
         tabManager.renameScope(from, to);
+      }
+      // open/release 走协议命令（与上游一致，经 execute 的 scope gating）；身份规则：
+      // scope 本人（thread=scope id）或开 scope 的父线程都能释放，其它身份 mismatch。
+      if (a.action === "open") {
+        const opened = await execute({ method: "openScope" }, scopeFor());
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                opened.ok && opened.scope
+                  ? {
+                      ...opened.scope,
+                      hint: `pass group="${opened.scope.id}" on subsequent calls to route them into this scope`,
+                    }
+                  : opened,
+              ),
+            },
+          ],
+        };
+      }
+      if (a.action === "release") {
+        const released = await execute(
+          { method: "releaseScope", closeTabs: a.closeTabs === true },
+          scopeFor(a.scopeId),
+        );
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(released) }],
+        };
       }
       const info = tabManager.scopeInfo(scopeFor());
       return {

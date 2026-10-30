@@ -158,6 +158,13 @@ thread 名——同一 OpenCode 项目/配置下的重连会落回同一分组�
 - **归还**：`markDeliverable`/`finalize`/`closeSession` 把 tab 释放回 user tab
   （页面保留、脱离分组）。MCP session 收到 DELETE（显式 terminate）时也会
   对该 session 寻址过的所有分组执行 closeSession。
+- **控制作用域（control scope，对齐 ZCode 上游 openScope/releaseScope）**：
+  临时子任务（如并行子代理）用 `browser_scope action=open` 申请一个一次性
+  控制区，拿到 scope id 后以 `group: <id>` 寻址，tab 落进独立分组；用完
+  `action=release` 释放（`closeTabs: true` 连 tab 一起关，缺省释放为 user
+  tab）。释放后留**关闭屏障**：同 id 再 open 返回 `rejected`、路由到该组的
+  命令被拒——迟到的命令不能复活已释放的资源。身份边界：开 scope 的线程与
+  scope 自身（`group: <id>`）可释放，其它身份返回 identity mismatch。
 - **孤儿分组（session 死亡检测）**：MCP 客户端断开通常不发 DELETE（SDK 的
   `client.close()` 只 abort standalone SSE），所以存活判定不看 transport
   开关而看 SSE 流：挂过 SSE 的 session 断开超过
